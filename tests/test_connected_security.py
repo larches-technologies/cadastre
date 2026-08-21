@@ -310,6 +310,45 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertEqual(len(json.load(urllib.request.urlopen(self.base + "/api/connected"))["disks"]), 1)
         self.assertIn(b"CONNECTED DEVICES", urllib.request.urlopen(self.base + "/").read())
 
+    def test_connected_membership_uses_exact_stable_id_and_refreshes(self):
+        first = json.load(urllib.request.urlopen(self.base + "/api/connected"))["disks"][0]
+        self.assertEqual(first["inventoryStatus"], "not-in-inventory")
+        from cadastre.store import Store
+
+        item = {
+            "stableId": "usb-1",
+            "device": "/dev/different",
+            "brand": "",
+            "model": "",
+            "sizeBytes": 1,
+            "serial": "different",
+            "partitionTable": "unknown",
+            "filesystems": [],
+            "smartStatus": "unknown",
+            "transport": "usb",
+            "removable": True,
+            "readOnly": True,
+        }
+        Store(str(Path(self.temp.name) / "db.sqlite")).add_disk(item)
+        second = json.load(urllib.request.urlopen(self.base + "/api/connected"))["disks"][0]
+        self.assertEqual(second["inventoryStatus"], "in-inventory")
+
+    def test_connected_membership_reports_unknown_when_inventory_degrades(self):
+        from unittest.mock import patch
+
+        from cadastre.store import Store
+
+        with patch.object(Store, "list_disks", side_effect=OSError("degraded")):
+            item = json.load(urllib.request.urlopen(self.base + "/api/connected"))["disks"][0]
+        self.assertEqual(item["inventoryStatus"], "unknown")
+
+    def test_direct_routes_serve_app_without_404(self):
+        root = urllib.request.urlopen(self.base + "/").read()
+        for path in ["/connected", "/inventory"]:
+            response = urllib.request.urlopen(self.base + path)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), root)
+
     def test_missing_invalid_token_and_invalid_origin(self):
         self.assertEqual(self.error("/api/connected/mount", payload={"confirmed": True}), (401, "ACTION_TOKEN_REQUIRED"))
         self.assertEqual(
@@ -390,3 +429,9 @@ class ConnectedUiContractTests(unittest.TestCase):
             self.assertIn(text, html)
         self.assertIn("!d.isSystem&&p.supported&&!p.identityAmbiguous&&!p.mountpoint", js)
         self.assertIn("browse=p.browseAllowed", js)
+        for text in ["In inventory", "Not in inventory", "Inventory status unknown", "popstate", "pushState"]:
+            self.assertIn(text, js)
+        self.assertIn('aria-label="Primary"', html)
+        self.assertIn('data-view="connected"', html)
+        self.assertGreaterEqual(html.count('data-view="inventory"'), 3)
+        self.assertIn("await inventory();await connected()", js)

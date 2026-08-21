@@ -75,9 +75,23 @@ def create_server(
                 self.json_response(200, {"actionToken": action_token})
             elif parsed.path == "/api/connected":
                 try:
-                    self.json_response(200, {"disks": connected.live(), "manualRefresh": True})
+                    disks = connected.live()
                 except (DiscoveryError, ActionError) as exc:
                     self.error_response(getattr(exc, "status", 503), getattr(exc, "code", "DISCOVERY_FAILED"), str(exc))
+                    return
+                try:
+                    inventory_ids = {disk["stableId"] for disk in store.list_disks()}
+                except Exception:  # inventory degradation must not hide live host state
+                    LOG.exception("Persisted inventory lookup failed during connected refresh")
+                    for disk in disks:
+                        disk["inventoryStatus"] = "unknown"
+                else:
+                    for disk in disks:
+                        # Membership is authoritative only by the exact physical-disk stable ID.
+                        disk["inventoryStatus"] = (
+                            "in-inventory" if disk.get("stableId") in inventory_ids else "not-in-inventory"
+                        )
+                self.json_response(200, {"disks": disks, "manualRefresh": True})
             elif parsed.path in {"/api/browse", "/api/preview"}:
                 try:
                     query = parse_qs(parsed.query)
@@ -112,7 +126,7 @@ def create_server(
                         "Disk discovery is unavailable",
                         str(exc),
                     )
-            elif parsed.path in {"/", "/index.html"}:
+            elif parsed.path in {"/", "/index.html", "/connected", "/inventory"}:
                 self.serve_file(STATIC / "index.html", "text/html; charset=utf-8")
             elif parsed.path == "/app.css":
                 self.serve_file(STATIC / "app.css", "text/css; charset=utf-8")
