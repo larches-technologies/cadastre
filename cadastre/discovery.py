@@ -86,6 +86,7 @@ def _partitions(node: dict[str, Any], disk_stable_id: str) -> list[dict[str, Any
                     "number": number,
                     "partuuid": partuuid,
                     "sizeBytes": int(child.get("size") or 0),
+                    "startBytes": int(child.get("start") or 0),
                     "filesystem": filesystem,
                     "filesystemUuid": filesystem_uuid,
                     "mountpoint": mountpoints[0] if mountpoints else None,
@@ -102,16 +103,23 @@ def _partitions(node: dict[str, Any], disk_stable_id: str) -> list[dict[str, Any
 
 
 def _mark_duplicate_filesystem_uuids(disks: list[dict[str, Any]]) -> None:
-    by_uuid: dict[str, list[dict[str, Any]]] = {}
+    by_uuid: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
     for disk in disks:
         for partition in disk["partitions"]:
             if partition["filesystemUuid"]:
-                by_uuid.setdefault(partition["filesystemUuid"].lower(), []).append(partition)
+                by_uuid.setdefault(partition["filesystemUuid"].lower(), []).append((disk, partition))
     for matches in by_uuid.values():
-        if len(matches) > 1:
-            for partition in matches:
+        disk_ids = {disk["stableId"] for disk, _ in matches}
+        if len(matches) <= 1:
+            continue
+        if len(disk_ids) == 1:
+            for _, partition in matches:
                 partition["identityAmbiguous"] = True
                 partition["supported"] = False
+        else:
+            for _, partition in matches:
+                partition["possibleClone"] = True
+                partition["duplicateFilesystemUuid"] = True
 
 
 def _udev_properties(device: str, runner: Runner) -> dict[str, str]:
@@ -145,9 +153,7 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
     """Enumerate physical disks without mounting or traversing their contents."""
     if not shutil.which("lsblk"):
         raise DiscoveryError("lsblk is required but was not found")
-    columns = (
-        "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,UUID,PARTUUID,PARTN,MOUNTPOINTS,RM,HOTPLUG,RO,TRAN"
-    )
+    columns = "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,UUID,PARTUUID,PARTN,START,MOUNTPOINTS,RM,HOTPLUG,RO,TRAN"  # noqa: E501
     result = _run(["lsblk", "--json", "--bytes", "--output", columns], runner)
     if result.returncode:
         detail = result.stderr.strip() or f"exit {result.returncode}"

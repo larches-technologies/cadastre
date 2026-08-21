@@ -203,8 +203,9 @@ class PartitionIdentityTests(unittest.TestCase):
         fallback = disks[0]["partitions"][0]
         self.assertEqual(fallback["incarnationId"], "disk-b:partuuid:part-1")
         self.assertTrue(fallback["requiresIdentityConfirmation"])
-        self.assertTrue(disks[0]["partitions"][1]["identityAmbiguous"])
-        self.assertFalse(disks[1]["partitions"][0]["supported"])
+        self.assertTrue(disks[0]["partitions"][1]["possibleClone"])
+        self.assertTrue(disks[1]["partitions"][0]["possibleClone"])
+        self.assertFalse(disks[0]["partitions"][1]["identityAmbiguous"])
 
     def test_partition_idempotency_and_reformat_replacement(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -249,6 +250,174 @@ class PartitionIdentityTests(unittest.TestCase):
             self.assertEqual(store.get_partition(first["incarnationId"])["status"], "replaced")
             self.assertEqual(second["replaces"], first["incarnationId"])
             self.assertEqual(len(store.list_partitions()), 2)
+
+
+class CanonicalLineageAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "lineage.db")
+        self.store.initialize()
+        self.disk = {
+            "stableId": "disk-1",
+            "device": "/dev/sdb",
+            "brand": "Acme",
+            "model": "Archive",
+            "sizeBytes": 100,
+            "serial": "one",
+            "partitionTable": "gpt",
+            "filesystems": ["ext4"],
+            "smartStatus": "unavailable",
+            "smartDetail": None,
+            "transport": "usb",
+            "removable": True,
+            "readOnly": False,
+        }
+        self.part = {
+            "incarnationId": "disk-1:fsuuid:fs-1",
+            "device": "/dev/sdb1",
+            "name": "sdb1",
+            "number": 1,
+            "partuuid": "part-a",
+            "startBytes": 2048,
+            "sizeBytes": 80,
+            "filesystem": "ext4",
+            "filesystemUuid": "fs-1",
+            "identityConfidence": "high",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_same_uuid_geometry_change_stays_current_one_lineage(self):
+        self.store.add_partition(self.disk, self.part)
+        changed = {
+            **self.part,
+            "device": "/dev/sdb3",
+            "name": "sdb3",
+            "number": 3,
+            "partuuid": "part-b",
+            "startBytes": 4096,
+            "sizeBytes": 90,
+        }
+        current, created = self.store.add_partition(self.disk, changed)
+        self.assertFalse(created)
+        self.assertEqual(current["displayStatus"], "Current")
+        self.assertEqual(current["lineageId"], self.part["incarnationId"])
+        self.assertEqual(len(current["geometryObservations"]), 2)
+        self.assertEqual(len(self.store.list_partitions()), 1)
+
+    def test_changed_uuid_replaces_old(self):
+        old, _ = self.store.add_partition(self.disk, self.part)
+        new = {**self.part, "incarnationId": "disk-1:fsuuid:fs-2", "filesystemUuid": "fs-2"}
+        current, _ = self.store.add_partition(self.disk, new)
+        self.assertEqual(self.store.get_partition(old["incarnationId"])["displayStatus"], "Historical")
+        self.assertEqual(current["displayStatus"], "Current")
+
+    def test_additive_migration_from_v2(self):
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(partition_incarnations)")}
+        self.assertTrue({"lineage_id", "start_bytes"} <= columns)
+
+
+class DuplicateUuidAcceptanceTests(unittest.TestCase):
+    @patch("cadastre.discovery.shutil.which", side_effect=lambda n: "/usr/bin/" + n if n == "lsblk" else None)
+    def test_cross_disk_uuid_is_distinct_possible_clone(self, _):
+        data = {
+            "blockdevices": [
+                {
+                    "name": "sdb",
+                    "path": "/dev/sdb",
+                    "type": "disk",
+                    "serial": "a",
+                    "children": [{"name": "sdb1", "type": "part", "uuid": "same", "fstype": "ext4"}],
+                },
+                {
+                    "name": "sdc",
+                    "path": "/dev/sdc",
+                    "type": "disk",
+                    "serial": "b",
+                    "children": [{"name": "sdc1", "type": "part", "uuid": "same", "fstype": "ext4"}],
+                },
+            ]
+        }
+        disks = discover_disks(runner=lambda *a, **k: completed(json.dumps(data))).disks
+        parts = [d["partitions"][0] for d in disks]
+        self.assertNotEqual(parts[0]["incarnationId"], parts[1]["incarnationId"])
+        self.assertTrue(all(p["possibleClone"] and not p["identityAmbiguous"] for p in parts))
+
+    @patch("cadastre.discovery.shutil.which", side_effect=lambda n: "/usr/bin/" + n if n == "lsblk" else None)
+    def test_duplicate_uuid_within_disk_fails_closed(self, _):
+        data = {
+            "blockdevices": [
+                {
+                    "name": "sdb",
+                    "path": "/dev/sdb",
+                    "type": "disk",
+                    "serial": "a",
+                    "children": [
+                        {"name": "sdb1", "type": "part", "uuid": "same", "fstype": "ext4"},
+                        {"name": "sdb2", "type": "part", "uuid": "same", "fstype": "ext4"},
+                    ],
+                }
+            ]
+        }
+        parts = discover_disks(runner=lambda *a, **k: completed(json.dumps(data))).disks[0]["partitions"]
+        self.assertTrue(all(p["identityAmbiguous"] and not p["supported"] for p in parts))
+
+
+class StructuredEjectUiAcceptanceTests(unittest.TestCase):
+    def test_req_preserves_structured_error_and_renderer_escapes(self):
+        source = (Path(__file__).parent.parent / "static" / "app.js").read_text()
+        self.assertIn("e.code=d.error?.code;e.data=d.error?.data", source)
+        self.assertIn("Partial eject: disk was not powered off", source)
+        self.assertIn("Succeeded unmounts:", source)
+        self.assertIn("Remaining mounts:", source)
+        for value in ("disk.brand", "disk.device", "b.device", "b.mountpoint", "b.pid", "b.process", "esc(x)"):
+            self.assertIn(value, source)
+        self.assertNotIn("cmdline", source)
+        self.assertNotIn("environ", source)
+
+    def test_structured_error_survives_req_and_renders_in_failure_surface(self):
+        source = (Path(__file__).parent.parent / "static" / "app.js").read_text()
+        req_source = source[source.index("async function req(") : source.index("async function health(")]
+        render_source = source[source.index("function ejectFailure(") : source.index("async function lifecycle(")]
+        payload = {
+            "error": {
+                "code": "EJECT_BLOCKED",
+                "message": "blocked",
+                "data": {
+                    "disk": {"brand": "A<", "model": "B&", "device": "/dev/sdz"},
+                    "blockers": [
+                        {
+                            "device": "/dev/sdz1",
+                            "mountpoint": "/m<",
+                            "pid": 42,
+                            "process": "bad<script>",
+                            "openPaths": ["/x&y"],
+                        }
+                    ],
+                    "succeededUnmounts": [],
+                    "remainingMounts": [{"device": "/dev/sdz1", "mountpoint": "/m<"}],
+                },
+            }
+        }
+        script = f"""
+        let actionToken='token';
+        const entities={{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}};
+        const esc=s=>String(s??'').replace(/[&<>"']/g,c=>entities[c]);
+        global.fetch=async()=>({{ok:false,status:409,json:async()=>({json.dumps(payload)})}});
+        {req_source}
+        {render_source}
+        req('/eject').then(()=>process.exit(2)).catch(e=>{{
+          const rendered=ejectFailure(e);
+          if(e.code!=='EJECT_BLOCKED'||!e.data||!rendered.includes('/dev/sdz1')||!rendered.includes('PID 42')||
+             !rendered.includes('bad&lt;script&gt;')||!rendered.includes('/x&amp;y')||
+             rendered.includes('<script>')) process.exit(3);
+        }});
+        """
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class PartitionApiTests(unittest.TestCase):
@@ -368,7 +537,7 @@ class PartitionApiTests(unittest.TestCase):
             self.assertEqual(store.list_disks()[0]["stableId"], "legacy")
             self.assertEqual(store.list_partitions(), [])
             with store.connect() as db:
-                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
 
 
 class InventoryRemovalTests(unittest.TestCase):
