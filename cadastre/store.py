@@ -97,7 +97,13 @@ class Store:
                 "SELECT attempted_at, status, detail FROM index_attempts WHERE stable_id = ? ORDER BY attempted_at DESC",
                 (stable_id,),
             ).fetchall()
-        return self._serialize(row, attempts)
+            partitions = db.execute(
+                "SELECT * FROM partition_incarnations WHERE disk_stable_id = ? ORDER BY status, last_seen DESC",
+                (stable_id,),
+            ).fetchall()
+        result = self._serialize(row, attempts)
+        result["partitions"] = [self._serialize_partition(partition, row) for partition in partitions]
+        return result
 
     def list_disks(self) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -105,10 +111,20 @@ class Store:
             attempts = db.execute(
                 "SELECT stable_id, attempted_at, status, detail FROM index_attempts ORDER BY attempted_at DESC"
             ).fetchall()
+            partitions = db.execute("SELECT * FROM partition_incarnations ORDER BY last_seen DESC").fetchall()
         grouped: dict[str, list[sqlite3.Row]] = {}
         for attempt in attempts:
             grouped.setdefault(attempt["stable_id"], []).append(attempt)
-        return [self._serialize(row, grouped.get(row["stable_id"], [])) for row in rows]
+        disk_rows = {row["stable_id"]: row for row in rows}
+        children: dict[str, list[dict[str, Any]]] = {}
+        for partition in partitions:
+            children.setdefault(partition["disk_stable_id"], []).append(
+                self._serialize_partition(partition, disk_rows[partition["disk_stable_id"]])
+            )
+        result = [self._serialize(row, grouped.get(row["stable_id"], [])) for row in rows]
+        for disk in result:
+            disk["partitions"] = children.get(disk["stableId"], [])
+        return result
 
     def add_partition(self, disk: dict[str, Any], partition: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         """Persist a freshly discovered partition incarnation and preserve prior incarnations."""
@@ -200,7 +216,7 @@ class Store:
         return [self._serialize_partition(row) for row in rows]
 
     @staticmethod
-    def _serialize_partition(row: sqlite3.Row) -> dict[str, Any]:
+    def _serialize_partition(row: sqlite3.Row, disk: sqlite3.Row | None = None) -> dict[str, Any]:
         return {
             "incarnationId": row["incarnation_id"],
             "diskStableId": row["disk_stable_id"],
@@ -215,6 +231,12 @@ class Store:
             "firstSeen": row["first_seen"],
             "lastSeen": row["last_seen"],
             "status": row["status"],
+            "displayStatus": "Historical" if row["status"] != "present" else "Current",
+            "disk": (
+                {"stableId": disk["stable_id"], "brand": disk["brand"], "model": disk["model"], "serial": disk["serial"]}
+                if disk
+                else None
+            ),
             "replaces": row["replaces"],
             "replacedBy": row["replaced_by"],
         }

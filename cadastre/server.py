@@ -48,8 +48,8 @@ def create_server(
             self.end_headers()
             self.wfile.write(body)
 
-        def error_response(self, status: int, code: str, message: str, detail: str | None = None) -> None:
-            self.json_response(status, {"error": {"code": code, "message": message, "detail": detail}})
+        def error_response(self, status: int, code: str, message: str, detail: str | None = None, data=None) -> None:
+            self.json_response(status, {"error": {"code": code, "message": message, "detail": detail, "data": data}})
 
         def authorized_action(self):
             origin = self.headers.get("Origin")
@@ -90,7 +90,7 @@ def create_server(
             elif parsed.path == "/api/disks":
                 self.json_response(
                     HTTPStatus.OK,
-                    {"disks": store.list_disks(), "partitions": store.list_partitions(), "version": __version__},
+                    {"disks": store.list_disks(), "version": __version__},
                 )
             elif parsed.path == "/api/discovery":
                 try:
@@ -166,7 +166,7 @@ def create_server(
                     )
                     self.json_response(200, {"ok": True, "result": result})
                 except ActionError as exc:
-                    self.error_response(exc.status, exc.code, str(exc))
+                    self.error_response(exc.status, exc.code, str(exc), data=exc.data)
                 return
             if action_path != "/api/partitions":
                 self.error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Route not found")

@@ -8,21 +8,24 @@ import os
 import stat
 import subprocess
 import threading
+from contextlib import suppress
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from cadastre.discovery import discover_disks
 
 UDISKSCTL = "/usr/bin/udisksctl"
+FUSER = "/usr/bin/fuser"
 MOUNT_OPTIONS = "ro"
 LOG = logging.getLogger("cadastre.actions")
 
 
 class ActionError(RuntimeError):
-    def __init__(self, code, message, status=409):
+    def __init__(self, code, message, status=409, data=None):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.data = data
 
 
 def safe_relative(value):
@@ -172,14 +175,149 @@ class ConnectedDevices:
         LOG.info("action=unmount target=%s result=ok", device)
 
     def eject(self, stable_id):
-        disk, _ = self.target(stable_id=stable_id)
-        if disk["isSystem"] or not (disk["removable"] or disk["hotplug"] or disk["transport"] == "usb"):
-            raise ActionError("EJECT_NOT_ALLOWED", "Disk is not safely ejectable")
-        if any(p["mountpoint"] for p in disk["partitions"]):
-            raise ActionError("EJECT_MOUNTED", "Unmount every child partition first")
         with self.locks.setdefault(stable_id, threading.Lock()):
-            self.run([UDISKSCTL, "power-off", "-b", disk["device"]])
-        LOG.info("action=eject target=%s result=ok", disk["device"])
+            disk, _ = self.target(stable_id=stable_id)
+            identity = self._disk_identity(disk)
+            if disk["isSystem"]:
+                raise ActionError("EJECT_SYSTEM_DISK", "System disks cannot be ejected", data={"disk": identity})
+            if not (disk["removable"] or disk["hotplug"] or disk["transport"] == "usb"):
+                raise ActionError("EJECT_NOT_REMOVABLE", "Disk is not removable or hotplug", data={"disk": identity})
+            mounted = [part for part in disk["partitions"] if part.get("mountpoint")]
+            blockers = []
+            for part in mounted:
+                self._verify_child(stable_id, part)
+                blockers.extend(self._inspect(part))
+            if blockers:
+                raise ActionError(
+                    "EJECT_BLOCKED",
+                    "Processes are using this disk",
+                    data={
+                        "disk": identity,
+                        "blockers": blockers[:32],
+                        "succeededUnmounts": [],
+                        "remainingMounts": self._mounts(mounted),
+                    },
+                )
+            succeeded = []
+            for original in mounted:
+                try:
+                    current_disk, current = self.target(device=original["device"])
+                    if current_disk["stableId"] != stable_id or current is None:
+                        raise ActionError("TARGET_STALE", "Partition no longer belongs to the selected disk")
+                    if not current.get("mountpoint"):
+                        continue
+                    self._verify_child(stable_id, current)
+                    self.run([UDISKSCTL, "unmount", "-b", current["device"]])
+                    succeeded.append({"device": current["device"], "mountpoint": current["mountpoint"]})
+                    _, verified = self.target(device=current["device"])
+                    if verified and verified.get("mountpoint"):
+                        raise ActionError("UNMOUNT_VERIFICATION_FAILED", "Partition remained mounted")
+                except ActionError as exc:
+                    fresh, _ = self.target(stable_id=stable_id)
+                    remaining = self._mounts([part for part in fresh["partitions"] if part.get("mountpoint")])
+                    raise ActionError(
+                        "EJECT_PARTIAL" if succeeded else exc.code,
+                        "Eject stopped after a partial unmount" if succeeded else str(exc),
+                        exc.status,
+                        {
+                            "disk": identity,
+                            "succeededUnmounts": succeeded,
+                            "remainingMounts": remaining,
+                            "cause": exc.code,
+                        },
+                    ) from exc
+            final, _ = self.target(stable_id=stable_id)
+            remaining = [part for part in final["partitions"] if part.get("mountpoint")]
+            if remaining or final["device"] != disk["device"]:
+                raise ActionError(
+                    "EJECT_PARTIAL" if succeeded else "TARGET_STALE",
+                    "Disk state changed before power-off",
+                    data={"disk": identity, "succeededUnmounts": succeeded, "remainingMounts": self._mounts(remaining)},
+                )
+            try:
+                self.run([UDISKSCTL, "power-off", "-b", final["device"]])
+            except ActionError as exc:
+                raise ActionError(
+                    "POWER_OFF_FAILED",
+                    str(exc),
+                    exc.status,
+                    {"disk": identity, "succeededUnmounts": succeeded, "remainingMounts": []},
+                ) from exc
+        LOG.info("action=eject target=%s result=ok", final["device"])
+        return {"disk": identity, "succeededUnmounts": succeeded, "poweredOff": True}
+
+    @staticmethod
+    def _disk_identity(disk):
+        return {
+            "stableId": str(disk["stableId"])[:256],
+            "device": str(disk["device"])[:256],
+            "brand": str(disk.get("brand") or "Unknown")[:128],
+            "model": str(disk.get("model") or "Unknown model")[:128],
+            "serial": str(disk.get("serial") or "Unavailable")[:128],
+        }
+
+    @staticmethod
+    def _mounts(parts):
+        return [
+            {"device": str(part["device"])[:256], "mountpoint": str(part["mountpoint"])[:512]} for part in parts[:32]
+        ]
+
+    def _verify_child(self, stable_id, part):
+        disk, current = self.target(device=part["device"])
+        if disk["stableId"] != stable_id or current is None or current.get("mountpoint") != part.get("mountpoint"):
+            raise ActionError("TARGET_STALE", "Mounted partition changed during eject preflight")
+        if self.mount_state(current["device"], current["mountpoint"]) not in {"ro", "rw"}:
+            raise ActionError("INSPECTION_INCONCLUSIVE", "Mounted source could not be freshly verified")
+
+    def _inspect(self, part):
+        if not os.path.isfile(FUSER) or not os.access(FUSER, os.X_OK):
+            raise ActionError("INSPECTION_UNAVAILABLE", "Safe process inspection is unavailable", 503)
+        try:
+            result = self.runner(
+                [FUSER, "-m", "--", part["mountpoint"]], capture_output=True, text=True, timeout=10, check=False
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise ActionError("INSPECTION_UNAVAILABLE", "Safe process inspection failed", 503) from exc
+        if result.returncode == 1:
+            return []
+        if result.returncode != 0:
+            raise ActionError("INSPECTION_INCONCLUSIVE", "Process inspection was inconclusive")
+        pids = []
+        for token in (result.stdout or "").split():
+            digits = "".join(character for character in token if character.isdigit())
+            if digits and int(digits) not in pids:
+                pids.append(int(digits))
+        if not pids:
+            raise ActionError("INSPECTION_INCONCLUSIVE", "Inspector reported activity without process IDs")
+        return [self._blocker(part, pid) for pid in pids[:16]]
+
+    @staticmethod
+    def _blocker(part, pid):
+        root = os.path.realpath(part["mountpoint"])
+        try:
+            process = Path(f"/proc/{pid}/comm").read_text(errors="replace").strip()[:128] or "unknown"
+        except OSError:
+            process = "unknown"
+        paths = []
+        candidates = [Path(f"/proc/{pid}/cwd")]
+        with suppress(OSError):
+            candidates.extend(list(Path(f"/proc/{pid}/fd").iterdir())[:64])
+        for candidate in candidates:
+            target = os.path.realpath(candidate)
+            if target == root or target.startswith(root + os.sep):
+                relative = os.path.relpath(target, root)
+                value = "/" if relative == "." else "/" + relative
+                if value[:512] not in paths:
+                    paths.append(value[:512])
+            if len(paths) >= 8:
+                break
+        return {
+            "device": str(part["device"])[:256],
+            "mountpoint": str(part["mountpoint"])[:512],
+            "pid": pid,
+            "process": process,
+            "openPaths": paths,
+        }
 
     def _open_target(self, device, relative, directory):
         _, part = self.target(device=device)
