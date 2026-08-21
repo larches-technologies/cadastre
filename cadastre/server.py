@@ -50,7 +50,10 @@ def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "dat
                     {"status": "ready", "version": __version__, "scope": "local-read-only"},
                 )
             elif parsed.path == "/api/disks":
-                self.json_response(HTTPStatus.OK, {"disks": store.list_disks(), "version": __version__})
+                self.json_response(
+                    HTTPStatus.OK,
+                    {"disks": store.list_disks(), "partitions": store.list_partitions(), "version": __version__},
+                )
             elif parsed.path == "/api/discovery":
                 try:
                     result = discover_disks()
@@ -90,54 +93,76 @@ def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "dat
             self.wfile.write(body)
 
         def do_POST(self) -> None:  # noqa: N802
-            if urlparse(self.path).path != "/api/disks":
+            if urlparse(self.path).path != "/api/partitions":
                 self.error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Route not found")
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
-                stable_id = payload.get("stableId")
-                if not stable_id:
+                disk_id = payload.get("diskStableId")
+                incarnation_ids = payload.get("incarnationIds")
+                if not disk_id or not isinstance(incarnation_ids, list) or not incarnation_ids:
                     self.error_response(
                         HTTPStatus.BAD_REQUEST,
                         "SELECTION_REQUIRED",
-                        "Select a discovered disk explicitly before adding it",
+                        "Select at least one eligible discovered partition",
                     )
                     return
                 result = discover_disks()
-                selected = next((d for d in result.disks if d["stableId"] == stable_id), None)
-                if selected is None:
-                    self.error_response(
-                        HTTPStatus.CONFLICT,
-                        "DEVICE_NOT_PRESENT",
-                        "The selected disk is no longer present; rescan and select it again",
-                    )
+                disk = next((item for item in result.disks if item["stableId"] == disk_id), None)
+                if disk is None:
+                    self.error_response(HTTPStatus.CONFLICT, "DEVICE_NOT_PRESENT", "Disk is no longer present; rescan")
                     return
-                if selected["isSystem"] and payload.get("confirmSystemDisk") is not True:
+                if disk["isSystem"] and payload.get("confirmSystemDisk") is not True:
                     self.error_response(
                         HTTPStatus.CONFLICT,
                         "SYSTEM_DISK_CONFIRMATION_REQUIRED",
-                        "System disks are protected by default and require explicit confirmation",
+                        "System disks require explicit confirmation",
                     )
                     return
-                disk, created = store.add_disk(selected)
+                fresh = {partition["incarnationId"]: partition for partition in disk["partitions"]}
+                if len(set(incarnation_ids)) != len(incarnation_ids) or any(
+                    item not in fresh for item in incarnation_ids
+                ):
+                    self.error_response(
+                        HTTPStatus.CONFLICT,
+                        "PARTITION_SELECTION_STALE",
+                        "Partition selection is stale or does not match fresh discovery",
+                    )
+                    return
+                selected = [fresh[item] for item in incarnation_ids]
+                if any(not partition["supported"] or partition["identityAmbiguous"] for partition in selected):
+                    self.error_response(
+                        HTTPStatus.CONFLICT,
+                        "FILESYSTEM_NOT_SUPPORTED",
+                        "One or more selected partitions are unsupported or identity-ambiguous",
+                    )
+                    return
+                if (
+                    any(partition["requiresIdentityConfirmation"] for partition in selected)
+                    and payload.get("confirmDegradedIdentity") is not True
+                ):
+                    self.error_response(
+                        HTTPStatus.CONFLICT,
+                        "DEGRADED_IDENTITY_CONFIRMATION_REQUIRED",
+                        "Partitions without a filesystem UUID require explicit identity confirmation",
+                    )
+                    return
+                persisted = [store.add_partition(disk, partition) for partition in selected]
                 self.json_response(
-                    HTTPStatus.CREATED if created else HTTPStatus.OK,
-                    {"disk": disk, "created": created},
+                    HTTPStatus.CREATED if any(created for _, created in persisted) else HTTPStatus.OK,
+                    {
+                        "partitions": [partition for partition, _ in persisted],
+                        "created": [created for _, created in persisted],
+                    },
                 )
             except DiscoveryError as exc:
                 self.error_response(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "DISCOVERY_FAILED",
-                    "Disk discovery is unavailable",
-                    str(exc),
+                    HTTPStatus.SERVICE_UNAVAILABLE, "DISCOVERY_FAILED", "Disk discovery is unavailable", str(exc)
                 )
             except (json.JSONDecodeError, ValueError) as exc:
                 self.error_response(
-                    HTTPStatus.BAD_REQUEST,
-                    "INVALID_REQUEST",
-                    "Request body must be valid JSON",
-                    str(exc),
+                    HTTPStatus.BAD_REQUEST, "INVALID_REQUEST", "Request body must be valid JSON", str(exc)
                 )
 
     return ThreadingHTTPServer((host, port), Handler)

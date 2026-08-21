@@ -61,3 +61,11 @@ uvx ruff format --check .
 ## Deliberately deferred
 
 File/folder indexing, hashes, similarity, plug/inotify watching, copy or follow-up workflows, mounts, wipe, delete, repair, and remote/tenant deployment are outside MVP0.
+
+### Partition incarnation identity
+
+Cadastre inventory selection is partition-level. Supported filesystems are ext2, ext3, ext4, NTFS, exFAT, and VFAT/FAT32 aliases. The server re-runs discovery and validates every selected incarnation; client metadata is never persisted directly. APFS, unknown filesystems, and duplicate filesystem UUIDs are blocked.
+
+The preferred identity is disk stable ID plus filesystem UUID. If UUID is absent, Cadastre uses disk stable ID plus PARTUUID, then partition number/path as a deterministic degraded fallback requiring explicit confirmation. Reformatting to a new filesystem UUID creates a distinct record. A new incarnation in the same partition slot marks its prior incarnation `replaced` and records `replaces`/`replacedBy`. Historical rows are retained. Duplicate filesystem UUIDs discovered concurrently are ambiguous and cannot be added.
+
+The additive `partition_incarnations` table is created with `CREATE TABLE IF NOT EXISTS`; existing whole-disk `disks` and `index_attempts` rows remain readable. `GET /api/disks` returns both `disks` and `partitions`; `POST /api/partitions` accepts `diskStableId`, freshly discovered `incarnationIds`, and explicit confirmation flags when required.

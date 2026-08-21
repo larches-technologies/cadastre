@@ -38,6 +38,23 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_attempts_disk ON index_attempts(stable_id);
                 """
             )
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version < 2:
+                db.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS partition_incarnations (
+                        incarnation_id TEXT PRIMARY KEY,
+                        disk_stable_id TEXT NOT NULL REFERENCES disks(stable_id),
+                        device TEXT, name TEXT NOT NULL, partition_number INTEGER, slot_key TEXT NOT NULL,
+                        partuuid TEXT, filesystem TEXT NOT NULL, filesystem_uuid TEXT, size_bytes INTEGER NOT NULL,
+                        identity_confidence TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+                        status TEXT NOT NULL, replaces TEXT, replaced_by TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_partitions_disk ON partition_incarnations(disk_stable_id);
+                    CREATE INDEX IF NOT EXISTS idx_partitions_slot ON partition_incarnations(disk_stable_id, slot_key);
+                    PRAGMA user_version = 2;
+                    """
+                )
 
     def add_disk(self, disk: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         now = datetime.now(UTC).isoformat()
@@ -92,6 +109,93 @@ class Store:
         for attempt in attempts:
             grouped.setdefault(attempt["stable_id"], []).append(attempt)
         return [self._serialize(row, grouped.get(row["stable_id"], [])) for row in rows]
+
+    def add_partition(self, disk: dict[str, Any], partition: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Persist a freshly discovered partition incarnation and preserve prior incarnations."""
+        self.add_disk(disk)
+        now = datetime.now(UTC).isoformat()
+        incarnation_id = partition["incarnationId"]
+        slot_key = str(partition.get("number") or partition.get("device") or partition["name"])
+        with self.connect() as db:
+            existed = (
+                db.execute("SELECT 1 FROM partition_incarnations WHERE incarnation_id = ?", (incarnation_id,)).fetchone()
+                is not None
+            )
+            previous = db.execute(
+                """SELECT incarnation_id FROM partition_incarnations
+                WHERE disk_stable_id = ? AND slot_key = ? AND incarnation_id != ?
+                ORDER BY last_seen DESC LIMIT 1""",
+                (disk["stableId"], slot_key, incarnation_id),
+            ).fetchone()
+            replaces = previous["incarnation_id"] if previous else None
+            if previous:
+                db.execute(
+                    "UPDATE partition_incarnations SET status='replaced', replaced_by=? WHERE incarnation_id=?",
+                    (incarnation_id, replaces),
+                )
+            db.execute(
+                """INSERT INTO partition_incarnations (
+                    incarnation_id, disk_stable_id, device, name, partition_number, slot_key, partuuid,
+                    filesystem, filesystem_uuid, size_bytes, identity_confidence, first_seen, last_seen,
+                    status, replaces, replaced_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present', ?, NULL)
+                ON CONFLICT(incarnation_id) DO UPDATE SET device=excluded.device, name=excluded.name,
+                    partition_number=excluded.partition_number, partuuid=excluded.partuuid,
+                    filesystem=excluded.filesystem, filesystem_uuid=excluded.filesystem_uuid,
+                    size_bytes=excluded.size_bytes, identity_confidence=excluded.identity_confidence,
+                    last_seen=excluded.last_seen, status='present'""",
+                (
+                    incarnation_id,
+                    disk["stableId"],
+                    partition.get("device"),
+                    partition["name"],
+                    partition.get("number"),
+                    slot_key,
+                    partition.get("partuuid"),
+                    partition["filesystem"],
+                    partition.get("filesystemUuid"),
+                    partition["sizeBytes"],
+                    partition["identityConfidence"],
+                    now,
+                    now,
+                    replaces,
+                ),
+            )
+        return self.get_partition(incarnation_id), not existed
+
+    def get_partition(self, incarnation_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM partition_incarnations WHERE incarnation_id = ?", (incarnation_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(incarnation_id)
+        return self._serialize_partition(row)
+
+    def list_partitions(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM partition_incarnations ORDER BY last_seen DESC").fetchall()
+        return [self._serialize_partition(row) for row in rows]
+
+    @staticmethod
+    def _serialize_partition(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "incarnationId": row["incarnation_id"],
+            "diskStableId": row["disk_stable_id"],
+            "device": row["device"],
+            "name": row["name"],
+            "number": row["partition_number"],
+            "partuuid": row["partuuid"],
+            "filesystem": row["filesystem"],
+            "filesystemUuid": row["filesystem_uuid"],
+            "sizeBytes": row["size_bytes"],
+            "identityConfidence": row["identity_confidence"],
+            "firstSeen": row["first_seen"],
+            "lastSeen": row["last_seen"],
+            "status": row["status"],
+            "replaces": row["replaces"],
+            "replacedBy": row["replaced_by"],
+        }
 
     @staticmethod
     def _serialize(row: sqlite3.Row, attempts: list[sqlite3.Row]) -> dict[str, Any]:

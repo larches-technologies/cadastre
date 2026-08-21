@@ -12,6 +12,9 @@ from typing import Any
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
+SUPPORTED_FILESYSTEMS = frozenset({"ext2", "ext3", "ext4", "ntfs", "exfat", "vfat"})
+FILESYSTEM_ALIASES = {"fat": "vfat", "fat32": "vfat", "msdos": "vfat"}
+
 
 class DiscoveryError(RuntimeError):
     """Discovery failed before a trustworthy device list could be produced."""
@@ -46,24 +49,68 @@ def _filesystems(node: dict[str, Any]) -> list[str]:
     return found
 
 
-def _partitions(node: dict[str, Any]) -> list[dict[str, Any]]:
+def normalize_filesystem(value: str | None) -> str | None:
+    """Normalize only known lsblk aliases; unknown values remain truthful."""
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    return FILESYSTEM_ALIASES.get(normalized, normalized)
+
+
+def _partitions(node: dict[str, Any], disk_stable_id: str) -> list[dict[str, Any]]:
     """Return partition metadata already present in the lsblk device tree."""
     partitions: list[dict[str, Any]] = []
     for child in node.get("children") or []:
         if child.get("type") == "part":
             device = child.get("path") or (f"/dev/{child['name']}" if child.get("name") else None)
+            name = child.get("name") or device or "Unknown partition"
+            number = child.get("partn")
             mountpoints = [mount for mount in (child.get("mountpoints") or []) if mount]
+            filesystem = normalize_filesystem(child.get("fstype"))
+            filesystem_uuid = (child.get("uuid") or "").strip() or None
+            partuuid = (child.get("partuuid") or "").strip() or None
+            if filesystem_uuid:
+                identity_key = f"fsuuid:{filesystem_uuid.lower()}"
+                confidence = "high"
+            elif partuuid:
+                identity_key = f"partuuid:{partuuid.lower()}"
+                confidence = "degraded"
+            else:
+                slot = str(number) if number is not None else (device or name)
+                identity_key = f"slot:{slot}"
+                confidence = "degraded"
             partitions.append(
                 {
-                    "name": child.get("name") or device or "Unknown partition",
+                    "name": name,
                     "device": device,
+                    "number": number,
+                    "partuuid": partuuid,
                     "sizeBytes": int(child.get("size") or 0),
-                    "filesystem": child.get("fstype") or None,
+                    "filesystem": filesystem,
+                    "filesystemUuid": filesystem_uuid,
                     "mountpoint": mountpoints[0] if mountpoints else None,
+                    "incarnationId": f"{disk_stable_id}:{identity_key}",
+                    "identityConfidence": confidence,
+                    "requiresIdentityConfirmation": confidence == "degraded",
+                    "identityAmbiguous": False,
+                    "supported": filesystem in SUPPORTED_FILESYSTEMS,
                 }
             )
-        partitions.extend(_partitions(child))
+        partitions.extend(_partitions(child, disk_stable_id))
     return partitions
+
+
+def _mark_duplicate_filesystem_uuids(disks: list[dict[str, Any]]) -> None:
+    by_uuid: dict[str, list[dict[str, Any]]] = {}
+    for disk in disks:
+        for partition in disk["partitions"]:
+            if partition["filesystemUuid"]:
+                by_uuid.setdefault(partition["filesystemUuid"].lower(), []).append(partition)
+    for matches in by_uuid.values():
+        if len(matches) > 1:
+            for partition in matches:
+                partition["identityAmbiguous"] = True
+                partition["supported"] = False
 
 
 def _udev_properties(device: str, runner: Runner) -> dict[str, str]:
@@ -97,7 +144,7 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
     """Enumerate physical disks without mounting or traversing their contents."""
     if not shutil.which("lsblk"):
         raise DiscoveryError("lsblk is required but was not found")
-    columns = "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,MOUNTPOINTS,RM,RO,TRAN"
+    columns = "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,UUID,PARTUUID,PARTN,MOUNTPOINTS,RM,RO,TRAN"
     result = _run(["lsblk", "--json", "--bytes", "--output", columns], runner)
     if result.returncode:
         detail = result.stderr.strip() or f"exit {result.returncode}"
@@ -134,7 +181,7 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
                 "sizeBytes": int(node.get("size") or 0),
                 "serial": serial or "Unavailable",
                 "partitionTable": node.get("pttype") or "None detected",
-                "partitions": _partitions(node),
+                "partitions": _partitions(node, stable_id),
                 "filesystems": _filesystems(node),
                 "smartStatus": smart,
                 "smartDetail": smart_detail,
@@ -145,6 +192,7 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
                 "systemReasons": system_reasons,
             }
         )
+    _mark_duplicate_filesystem_uuids(disks)
     return DiscoveryResult(disks=disks, warnings=warnings)
 
 
