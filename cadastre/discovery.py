@@ -46,6 +46,26 @@ def _filesystems(node: dict[str, Any]) -> list[str]:
     return found
 
 
+def _partitions(node: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return partition metadata already present in the lsblk device tree."""
+    partitions: list[dict[str, Any]] = []
+    for child in node.get("children") or []:
+        if child.get("type") == "part":
+            device = child.get("path") or (f"/dev/{child['name']}" if child.get("name") else None)
+            mountpoints = [mount for mount in (child.get("mountpoints") or []) if mount]
+            partitions.append(
+                {
+                    "name": child.get("name") or device or "Unknown partition",
+                    "device": device,
+                    "sizeBytes": int(child.get("size") or 0),
+                    "filesystem": child.get("fstype") or None,
+                    "mountpoint": mountpoints[0] if mountpoints else None,
+                }
+            )
+        partitions.extend(_partitions(child))
+    return partitions
+
+
 def _udev_properties(device: str, runner: Runner) -> dict[str, str]:
     if not shutil.which("udevadm"):
         return {}
@@ -114,6 +134,7 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
                 "sizeBytes": int(node.get("size") or 0),
                 "serial": serial or "Unavailable",
                 "partitionTable": node.get("pttype") or "None detected",
+                "partitions": _partitions(node),
                 "filesystems": _filesystems(node),
                 "smartStatus": smart,
                 "smartDetail": smart_detail,

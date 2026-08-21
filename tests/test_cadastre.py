@@ -88,5 +88,63 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(first["indexDates"], [])
 
 
+class AdditionalDiscoveryTests(unittest.TestCase):
+    @patch("cadastre.discovery.shutil.which", side_effect=lambda n: "/usr/bin/" + n if n == "lsblk" else None)
+    def test_partition_metadata_is_structured_and_truthful(self, _):
+        data = {
+            "blockdevices": [
+                {
+                    "name": "sdb",
+                    "path": "/dev/sdb",
+                    "type": "disk",
+                    "size": 3000,
+                    "children": [
+                        {
+                            "name": "sdb1",
+                            "path": "/dev/sdb1",
+                            "type": "part",
+                            "size": 1000,
+                            "fstype": "ntfs",
+                            "mountpoints": [None],
+                        },
+                        {
+                            "name": "sdb2",
+                            "path": "/dev/sdb2",
+                            "type": "part",
+                            "size": 2000,
+                            "fstype": None,
+                            "mountpoints": ["/media/archive"],
+                        },
+                    ],
+                }
+            ]
+        }
+        partitions = discover_disks(runner=lambda *a, **k: completed(json.dumps(data))).disks[0]["partitions"]
+        self.assertEqual(
+            partitions,
+            [
+                {"name": "sdb1", "device": "/dev/sdb1", "sizeBytes": 1000, "filesystem": "ntfs", "mountpoint": None},
+                {
+                    "name": "sdb2",
+                    "device": "/dev/sdb2",
+                    "sizeBytes": 2000,
+                    "filesystem": None,
+                    "mountpoint": "/media/archive",
+                },
+            ],
+        )
+
+
+class UiRenderingTests(unittest.TestCase):
+    def test_already_added_is_a_non_action_and_partition_states_are_present(self):
+        source = (Path(__file__).parent.parent / "static" / "app.js").read_text()
+        self.assertIn("ids.has(x.stableId)", source)
+        self.assertIn("Already added", source)
+        self.assertIn("No partitions detected by lsblk.", source)
+        self.assertIn("p.device||p.name", source)
+        already_branch = source.split("ids.has(x.stableId)?", 1)[1].split(":'<button", 1)[0]
+        self.assertNotIn("data-id", already_branch)
+
+
 if __name__ == "__main__":
     unittest.main()
