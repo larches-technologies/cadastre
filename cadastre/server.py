@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from cadastre import __version__
+from cadastre.connected import ActionError, ConnectedDevices
 from cadastre.discovery import DiscoveryError, discover_disks, filter_system_disks
 from cadastre.store import Store
 
@@ -18,11 +20,18 @@ LOG = logging.getLogger("cadastre")
 STATIC = Path(__file__).parent.parent / "static"
 
 
-def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "data/cadastre.db") -> ThreadingHTTPServer:
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 8741,
+    db_path: str = "data/cadastre.db",
+    connected_devices: ConnectedDevices | None = None,
+) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("Cadastre MVP0 only permits a local-only bind")
     store = Store(db_path)
     store.initialize()
+    connected = connected_devices or ConnectedDevices()
+    action_token = secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"Cadastre/{__version__}"
@@ -42,6 +51,19 @@ def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "dat
         def error_response(self, status: int, code: str, message: str, detail: str | None = None) -> None:
             self.json_response(status, {"error": {"code": code, "message": message, "detail": detail}})
 
+        def authorized_action(self):
+            origin = self.headers.get("Origin")
+            if origin and origin != f"http://{self.headers.get('Host')}":
+                self.error_response(403, "ORIGIN_REJECTED", "State-changing requests must be same-origin")
+                return False
+            if not secrets.compare_digest(self.headers.get("X-Cadastre-Action-Token", ""), action_token):
+                self.error_response(401, "ACTION_TOKEN_REQUIRED", "Action authorization is missing or stale")
+                return False
+            return True
+
+        def request_json(self):
+            return json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path in {"/health", "/ready"}:
@@ -49,6 +71,22 @@ def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "dat
                     HTTPStatus.OK,
                     {"status": "ready", "version": __version__, "scope": "local-read-only"},
                 )
+            elif parsed.path == "/api/session":
+                self.json_response(200, {"actionToken": action_token})
+            elif parsed.path == "/api/connected":
+                try:
+                    self.json_response(200, {"disks": connected.live(), "manualRefresh": True})
+                except (DiscoveryError, ActionError) as exc:
+                    self.error_response(getattr(exc, "status", 503), getattr(exc, "code", "DISCOVERY_FAILED"), str(exc))
+            elif parsed.path in {"/api/browse", "/api/preview"}:
+                try:
+                    query = parse_qs(parsed.query)
+                    args = (query.get("device", [""])[0], query.get("path", [""])[0])
+                    self.json_response(
+                        200, connected.browse(*args) if parsed.path.endswith("browse") else connected.preview(*args)
+                    )
+                except ActionError as exc:
+                    self.error_response(exc.status, exc.code, str(exc))
             elif parsed.path == "/api/disks":
                 self.json_response(
                     HTTPStatus.OK,
@@ -93,6 +131,8 @@ def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "dat
             self.wfile.write(body)
 
         def do_DELETE(self) -> None:  # noqa: N802
+            if not self.authorized_action():
+                return
             parsed = urlparse(self.path)
             prefix = "/api/disks/"
             if not parsed.path.startswith(prefix) or not parsed.path[len(prefix) :]:
@@ -108,12 +148,31 @@ def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "dat
                 self.error_response(HTTPStatus.NOT_FOUND, "INVENTORY_DISK_NOT_FOUND", "Inventory disk not found")
 
         def do_POST(self) -> None:  # noqa: N802
-            if urlparse(self.path).path != "/api/partitions":
+            if not self.authorized_action():
+                return
+            action_path = urlparse(self.path).path
+            if action_path in {"/api/connected/mount", "/api/connected/unmount", "/api/connected/eject"}:
+                try:
+                    payload = self.request_json()
+                    if payload.get("confirmed") is not True:
+                        self.error_response(409, "CONFIRMATION_REQUIRED", "Explicit confirmation is required")
+                        return
+                    result = (
+                        connected.mount(payload.get("device", ""))
+                        if action_path.endswith("mount") and not action_path.endswith("unmount")
+                        else connected.unmount(payload.get("device", ""))
+                        if action_path.endswith("unmount")
+                        else connected.eject(payload.get("stableId", ""))
+                    )
+                    self.json_response(200, {"ok": True, "result": result})
+                except ActionError as exc:
+                    self.error_response(exc.status, exc.code, str(exc))
+                return
+            if action_path != "/api/partitions":
                 self.error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Route not found")
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                payload = self.request_json()
                 disk_id = payload.get("diskStableId")
                 incarnation_ids = payload.get("incarnationIds")
                 if not disk_id or not isinstance(incarnation_ids, list) or not incarnation_ids:

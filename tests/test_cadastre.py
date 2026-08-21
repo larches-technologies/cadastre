@@ -299,7 +299,12 @@ class PartitionApiTests(unittest.TestCase):
             request = urllib.request.Request(
                 f"http://127.0.0.1:{server.server_port}/api/partitions",
                 data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Cadastre-Action-Token": json.load(
+                        urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}/api/session")
+                    )["actionToken"],
+                },
                 method="POST",
             )
             try:
@@ -419,7 +424,14 @@ class InventoryRemovalApiTests(unittest.TestCase):
             server = create_server("127.0.0.1", 0, str(Path(folder) / "test.db"))
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
-            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/disks/absent", method="DELETE")
+            token = json.load(urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}/api/session"))[
+                "actionToken"
+            ]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/disks/absent",
+                headers={"X-Cadastre-Action-Token": token},
+                method="DELETE",
+            )
             try:
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     urllib.request.urlopen(request)

@@ -73,3 +73,15 @@ The additive `partition_incarnations` table is created with `CREATE TABLE IF NOT
 ### Remove from inventory
 
 `DELETE /api/disks/{stableId}` removes only the trusted persisted Cadastre disk row and its associated partition-incarnation and index-attempt history in one SQLite transaction. An absent ID returns `404 INVENTORY_DISK_NOT_FOUND`. It invokes no disk command and does not unmount, write, format, wipe, delete, or otherwise modify the physical disk/filesystems. The disk can be discovered and added again. Inventory-record removal is not undoable in MVP0 and requires explicit UI confirmation.
+
+## Connected devices versus Inventory
+
+**Connected devices** is freshly discovered live host state and refreshes only when the operator selects Refresh. **Inventory** is persisted Cadastre metadata and history; removing an inventory record never changes the physical disk.
+
+Connected-device lifecycle uses only fixed-argv `/usr/bin/udisksctl` commands. UDisks/polkit may request or deny host authorization; Cadastre makes no policy, package, or configuration changes. Mount uses exactly `ro,nodev,nosuid,noexec`, and Cadastre independently verifies the active mount options with `findmnt`. An existing external read-write mount remains visible but is never silently remounted and cannot be browsed. If post-mount verification fails, browsing is denied and only the mount initiated by the current Cadastre process is rolled back.
+
+Unmount requires confirmation and is limited to mounts initiated by the current process; no force or lazy unmount is used. Eject is UDisks power-off, requires confirmation, applies only to non-system removable/hotplug/USB physical disks, and requires every child partition to be unmounted.
+
+The browser is read-only and one-level-per-request. It performs descriptor-relative, `O_NOFOLLOW` traversal, rejects absolute/NUL/parent paths and symlink traversal, labels symlinks and special files, never opens devices/FIFOs/sockets, caps listings at 500 entries, and offers UTF-8 regular-file preview only up to 256 KiB. There is no download, recursive walk, index, hash, search, or thumbnail generation.
+
+The HTTP service remains loopback-only. Every state-changing API, including inventory removal, requires a per-process action token and rejects cross-origin browser requests. The token is supplied to the local UI in a no-store session response and is not logged.

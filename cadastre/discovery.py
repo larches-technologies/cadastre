@@ -89,6 +89,7 @@ def _partitions(node: dict[str, Any], disk_stable_id: str) -> list[dict[str, Any
                     "filesystem": filesystem,
                     "filesystemUuid": filesystem_uuid,
                     "mountpoint": mountpoints[0] if mountpoints else None,
+                    "readOnly": bool(child.get("ro")),
                     "incarnationId": f"{disk_stable_id}:{identity_key}",
                     "identityConfidence": confidence,
                     "requiresIdentityConfirmation": confidence == "degraded",
@@ -144,7 +145,9 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
     """Enumerate physical disks without mounting or traversing their contents."""
     if not shutil.which("lsblk"):
         raise DiscoveryError("lsblk is required but was not found")
-    columns = "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,UUID,PARTUUID,PARTN,MOUNTPOINTS,RM,RO,TRAN"
+    columns = (
+        "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,UUID,PARTUUID,PARTN,MOUNTPOINTS,RM,HOTPLUG,RO,TRAN"
+    )
     result = _run(["lsblk", "--json", "--bytes", "--output", columns], runner)
     if result.returncode:
         detail = result.stderr.strip() or f"exit {result.returncode}"
@@ -187,6 +190,7 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
                 "smartDetail": smart_detail,
                 "transport": node.get("tran") or "unknown",
                 "removable": bool(node.get("rm")),
+                "hotplug": bool(node.get("hotplug")),
                 "readOnly": bool(node.get("ro")),
                 "isSystem": bool(system_reasons),
                 "systemReasons": system_reasons,
