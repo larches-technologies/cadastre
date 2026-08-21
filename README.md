@@ -4,7 +4,7 @@ Cadastre MVP0 is a local, read-only inventory for offline disks. It enumerates p
 
 ## Safety model
 
-Cadastre **observes only**. Discovery invokes `lsblk`, `udevadm`, and `smartctl` for metadata. It does not mount source disks, request read-write access, walk file trees, open user files, hash files, wipe, format, delete, or modify disk state. System disks are identified from system mount points and hidden by default. Showing one still requires explicit selection and a second confirmation.
+Cadastre inventory **observes only**. The separate Connected devices workflow can explicitly mount supported external partitions read-only, browse verified read-only mounts, unmount after confirmation, and safely power off eligible physical disks. It never requests read-write access, hashes files, wipes, formats, repairs, or deletes source data. System disks are protected from lifecycle actions.
 
 The SQLite database contains inventory records only and defaults to `data/cadastre.db` on the local machine. The server rejects non-loopback bind addresses.
 
@@ -60,7 +60,7 @@ uvx ruff format --check .
 
 ## Deliberately deferred
 
-File/folder indexing, hashes, similarity, plug/inotify watching, copy or follow-up workflows, mounts, wipe, delete, repair, and remote/tenant deployment are outside MVP0.
+File/folder indexing, hashes, similarity, plug/inotify watching, copy or follow-up workflows, wipe, delete, repair, and remote/tenant deployment are outside MVP0.
 
 ### Partition incarnation identity
 
@@ -78,9 +78,9 @@ The additive `partition_incarnations` table is created with `CREATE TABLE IF NOT
 
 **Connected devices** is freshly discovered live host state and refreshes only when the operator selects Refresh. **Inventory** is persisted Cadastre metadata and history; removing an inventory record never changes the physical disk.
 
-Connected-device lifecycle uses only fixed-argv `/usr/bin/udisksctl` commands. UDisks/polkit may request or deny host authorization; Cadastre makes no policy, package, or configuration changes. Mount uses exactly `ro,nodev,nosuid,noexec`, and Cadastre independently verifies the active mount options with `findmnt`. An existing external read-write mount remains visible but is never silently remounted and cannot be browsed. If post-mount verification fails, browsing is denied and only the mount initiated by the current Cadastre process is rolled back.
+Connected-device lifecycle uses only fixed-argv `/usr/bin/udisksctl` commands. UDisks/polkit may request or deny host authorization; Cadastre makes no policy, package, or configuration changes. Mount requests exactly `ro`, the portable UDisks read-only option, then independently verifies the canonical source, target, and active read-only options with `findmnt`. The previous extra option set could be rejected by UDisks/filesystem policy before a mount occurred. An existing external read-write mount remains visible but is never silently remounted and cannot be browsed because reads may update atime. If post-mount verification fails, browsing is denied and only the mount initiated by the current Cadastre process is rolled back.
 
-Unmount requires confirmation and is limited to mounts initiated by the current process; no force or lazy unmount is used. Eject is UDisks power-off, requires confirmation, applies only to non-system removable/hotplug/USB physical disks, and requires every child partition to be unmounted.
+Unmount requires confirmation and applies to freshly verified non-system removable/hotplug/USB partition mounts, including desktop/UDisks auto-mounts; no force or lazy unmount is used. An external read-only mount can be browsed after a Cadastre restart without process-local ownership. Eject is UDisks power-off, requires confirmation, applies only to non-system removable/hotplug/USB physical disks, and requires every child partition to be unmounted.
 
 The browser is read-only and one-level-per-request. It performs descriptor-relative, `O_NOFOLLOW` traversal, rejects absolute/NUL/parent paths and symlink traversal, labels symlinks and special files, never opens devices/FIFOs/sockets, caps listings at 500 entries, and offers UTF-8 regular-file preview only up to 256 KiB. There is no download, recursive walk, index, hash, search, or thumbnail generation.
 

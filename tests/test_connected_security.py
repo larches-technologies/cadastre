@@ -58,7 +58,13 @@ class LifecycleSecurityTests(unittest.TestCase):
             calls.append((argv, kwargs))
             if argv[0].endswith("findmnt"):
                 return result(
-                    json.dumps({"filesystems": [{"target": "/media/usb", "options": "ro,nodev,nosuid,noexec"}]})
+                    json.dumps(
+                        {
+                            "filesystems": [
+                                {"source": "/dev/sdz1", "target": "/media/usb", "options": "ro,nodev,nosuid,noexec"}
+                            ]
+                        }
+                    )
                 )
             return result()
 
@@ -67,7 +73,7 @@ class LifecycleSecurityTests(unittest.TestCase):
         self.assertEqual(mounted["mountpoint"], "/media/usb")
         self.assertEqual(calls[0][0], [UDISKSCTL, "mount", "-b", "/dev/sdz1", "-o", MOUNT_OPTIONS])
         self.assertIn(
-            (["/usr/bin/findmnt", "--json", "--source", "/dev/sdz1", "--output", "TARGET,OPTIONS"]),
+            (["/usr/bin/findmnt", "--json", "--source", "/dev/sdz1", "--output", "SOURCE,TARGET,OPTIONS"]),
             [c[0] for c in calls],
         )
         self.assertNotIn("shell", calls[0][1])
@@ -105,27 +111,34 @@ class LifecycleSecurityTests(unittest.TestCase):
         self.assertEqual(calls[-1], [UDISKSCTL, "unmount", "-b", "/dev/sdz1"])
         self.assertNotIn("/dev/sdz1", connected.owned_mounts)
 
-    def test_external_rw_browse_denied_and_unmount_owned_only(self):
+    def test_external_rw_browse_denied_but_confirmed_unmount_allowed(self):
         p = part(mountpoint="/media/external")
 
         def runner(argv, **kwargs):
             if argv[0].endswith("findmnt"):
-                return result(json.dumps({"filesystems": [{"options": "rw"}]}))
+                return result(
+                    json.dumps({"filesystems": [{"source": "/dev/sdz1", "target": "/media/external", "options": "rw"}]})
+                )
             return result()
 
         connected = ConnectedDevices(discovery([disk(p)]), runner)
         with self.assertRaises(ActionError) as browse:
             connected.browse("/dev/sdz1")
         self.assertEqual(browse.exception.code, "BROWSE_REQUIRES_READ_ONLY")
-        with self.assertRaises(ActionError) as unmount:
-            connected.unmount("/dev/sdz1")
-        self.assertEqual(unmount.exception.code, "UNMOUNT_NOT_OWNED")
+        connected.unmount("/dev/sdz1")
 
     def test_unmount_and_eject_exact_argv_and_restrictions(self):
         calls = []
-        connected = ConnectedDevices(
-            discovery([disk(part(mountpoint="/media/usb"))]), lambda argv, **k: calls.append(argv) or result()
-        )
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            if argv[0].endswith("findmnt"):
+                return result(
+                    json.dumps({"filesystems": [{"source": "/dev/sdz1", "target": "/media/usb", "options": "ro"}]})
+                )
+            return result()
+
+        connected = ConnectedDevices(discovery([disk(part(mountpoint="/media/usb"))]), runner)
         connected.owned_mounts.add("/dev/sdz1")
         connected.unmount("/dev/sdz1")
         self.assertEqual(calls[-1], [UDISKSCTL, "unmount", "-b", "/dev/sdz1"])
@@ -173,7 +186,9 @@ class BrowserContainmentTests(unittest.TestCase):
         p = part(mountpoint=str(self.root))
 
         def runner(argv, **kwargs):
-            return result(json.dumps({"filesystems": [{"options": "ro,nodev"}]}))
+            return result(
+                json.dumps({"filesystems": [{"source": "/dev/sdz1", "target": str(self.root), "options": "ro,nodev"}]})
+            )
 
         self.connected = ConnectedDevices(discovery([disk(p)]), runner)
 
@@ -363,15 +378,15 @@ class ConnectedUiContractTests(unittest.TestCase):
         html = (Path(__file__).parent.parent / "static/index.html").read_text()
         for text in [
             "Mount read-only",
-            "No valid action",
+            "No valid partition action",
             "Eject unavailable",
             "256 KiB",
             "Listing truncated at 500 entries",
             "confirm(copy[action])",
-            "nodev, nosuid, and noexec",
+            "Browse files",
         ]:
             self.assertIn(text, js)
         for text in ["CONNECTED DEVICES", "external RW mounts cannot be browsed", "Refresh connected"]:
             self.assertIn(text, html)
         self.assertIn("!d.isSystem&&p.supported&&!p.identityAmbiguous&&!p.mountpoint", js)
-        self.assertIn("p.mountpoint&&p.mountState==='ro'", js)
+        self.assertIn("browse=p.browseAllowed", js)

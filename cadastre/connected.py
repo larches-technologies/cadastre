@@ -14,7 +14,7 @@ from pathlib import PurePosixPath
 from cadastre.discovery import discover_disks
 
 UDISKSCTL = "/usr/bin/udisksctl"
-MOUNT_OPTIONS = "ro,nodev,nosuid,noexec"
+MOUNT_OPTIONS = "ro"
 LOG = logging.getLogger("cadastre.actions")
 
 
@@ -59,9 +59,25 @@ class ConnectedDevices:
     def live(self):
         disks = self.discoverer().disks
         for disk in disks:
+            disk["kind"] = "physical-disk"
             for part in disk["partitions"]:
-                part["mountState"] = self.mount_state(part["device"]) if part["mountpoint"] else None
-                part["cadastreOwned"] = part["device"] in self.owned_mounts
+                part["kind"] = "partition"
+                state = self.mount_state(part["device"], part["mountpoint"]) if part["mountpoint"] else None
+                owned = part["device"] in self.owned_mounts
+                part["mountState"] = state
+                part["cadastreOwned"] = owned
+                part["accessState"] = (
+                    "unmounted"
+                    if not part["mountpoint"]
+                    else "mounted-ro-cadastre"
+                    if state == "ro" and owned
+                    else "mounted-ro-external"
+                    if state == "ro"
+                    else "mounted-rw-external"
+                    if state == "rw"
+                    else "mounted-inaccessible-unknown"
+                )
+                part["browseAllowed"] = state == "ro"
         return disks
 
     def target(self, device=None, stable_id=None):
@@ -80,11 +96,22 @@ class ConnectedDevices:
             raise ActionError("ACTION_TIMEOUT", "UDisks action timed out", 504) from exc
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
-            unauthorized = "not authorized" in detail.lower()
+            lower = detail.lower()
+            unauthorized = "not authorized" in lower or "authorization" in lower
+            if "already mounted" in lower:
+                code, status = "ALREADY_MOUNTED", 409
+            elif "option" in lower and any(word in lower for word in ("not allowed", "invalid", "unsupported")):
+                code, status = "MOUNT_OPTIONS_UNSUPPORTED", 409
+            elif "unknown filesystem" in lower or "wrong fs type" in lower or "not supported" in lower:
+                code, status = "FILESYSTEM_UNSUPPORTED", 409
+            elif "busy" in lower:
+                code, status = "DEVICE_BUSY", 409
+            else:
+                code, status = ("UDISKS_UNAUTHORIZED", 403) if unauthorized else ("UDISKS_FAILED", 409)
             raise ActionError(
-                "UDISKS_UNAUTHORIZED" if unauthorized else "UDISKS_FAILED",
+                code,
                 detail or "UDisks action failed",
-                403 if unauthorized else 409,
+                status,
             )
         return result
 
@@ -98,16 +125,16 @@ class ConnectedDevices:
             self.run([UDISKSCTL, "mount", "-b", device, "-o", MOUNT_OPTIONS])
             self.owned_mounts.add(device)
             _, verified = self.target(device=device)
-            if not verified["mountpoint"] or self.mount_state(device) != "ro":
+            if not verified["mountpoint"] or self.mount_state(device, verified["mountpoint"]) != "ro":
                 self.run([UDISKSCTL, "unmount", "-b", device])
                 self.owned_mounts.discard(device)
                 raise ActionError("READ_ONLY_VERIFICATION_FAILED", "Mount was not verified read-only; browsing denied")
             LOG.info("action=mount target=%s result=verified_ro", device)
             return verified
 
-    def mount_state(self, device):
+    def mount_state(self, device, expected_target=None):
         result = self.runner(
-            ["/usr/bin/findmnt", "--json", "--source", device, "--output", "TARGET,OPTIONS"],
+            ["/usr/bin/findmnt", "--json", "--source", device, "--output", "SOURCE,TARGET,OPTIONS"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -116,18 +143,29 @@ class ConnectedDevices:
         if result.returncode:
             return None
         try:
-            options = set(json.loads(result.stdout).get("filesystems", [])[0].get("options", "").split(","))
+            rows = json.loads(result.stdout).get("filesystems", [])
+            if len(rows) != 1 or os.path.realpath(rows[0].get("source") or "") != os.path.realpath(device):
+                return None
+            if expected_target and os.path.realpath(rows[0].get("target") or "") != os.path.realpath(expected_target):
+                return None
+            options = set(rows[0].get("options", "").split(","))
         except (json.JSONDecodeError, IndexError, AttributeError):
             return None
         return "ro" if "ro" in options and "rw" not in options else "rw"
 
     def unmount(self, device):
-        _, part = self.target(device=device)
-        if device not in self.owned_mounts:
-            raise ActionError("UNMOUNT_NOT_OWNED", "Only Cadastre-initiated mounts may be unmounted")
+        disk, part = self.target(device=device)
+        protected = ("/", "/boot", "/usr", "/var", "/home")
+        mountpoint = part["mountpoint"] or ""
+        if disk["isSystem"] or any(mountpoint == root or mountpoint.startswith(root + "/") for root in protected):
+            raise ActionError("UNMOUNT_NOT_ALLOWED", "System, root, boot, and host data mounts cannot be unmounted")
+        if not (disk["removable"] or disk["hotplug"] or disk["transport"] == "usb"):
+            raise ActionError("UNMOUNT_NOT_ALLOWED", "Only removable or hotplug partitions may be unmounted")
         if not part["mountpoint"]:
             self.owned_mounts.discard(device)
             raise ActionError("NOT_MOUNTED", "Partition is not mounted")
+        if self.mount_state(device, mountpoint) not in {"ro", "rw"}:
+            raise ActionError("MOUNT_SOURCE_UNVERIFIED", "Mounted source could not be freshly verified")
         with self.locks.setdefault(device, threading.Lock()):
             self.run([UDISKSCTL, "unmount", "-b", device])
         self.owned_mounts.discard(device)
@@ -145,8 +183,13 @@ class ConnectedDevices:
 
     def _open_target(self, device, relative, directory):
         _, part = self.target(device=device)
-        if not part["mountpoint"] or self.mount_state(device) != "ro":
-            raise ActionError("BROWSE_REQUIRES_READ_ONLY", "Browsing requires a freshly verified read-only mount", 403)
+        if not part["mountpoint"] or self.mount_state(device, part["mountpoint"]) != "ro":
+            raise ActionError(
+                "BROWSE_REQUIRES_READ_ONLY",
+                "Browsing requires a verified read-only mount; read-write mounts are blocked "
+                "because reads may update atime",
+                403,
+            )
         components = [part for part in safe_relative(relative).parts if part not in {".", ""}]
         # O_NONBLOCK prevents special files such as FIFOs from hanging before
         # fstat can reject them; it does not change regular-file reads.
