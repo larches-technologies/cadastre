@@ -141,3 +141,13 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Cadastre local runtime data
+.venv/
+data/
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+.pytest_cache/
+.ruff_cache/

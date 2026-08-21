@@ -1,0 +1,20 @@
+[project]
+name = "cadastre"
+version = "0.1.0"
+description = "Read-only offline disk inventory"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.scripts]
+cadastre = "cadastre.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
