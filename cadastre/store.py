@@ -163,6 +163,28 @@ class Store:
             )
         return self.get_partition(incarnation_id), not existed
 
+    def remove_disk(self, stable_id: str) -> dict[str, Any]:
+        """Remove only persisted Cadastre records for one canonical disk ID."""
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM disks WHERE stable_id = ?", (stable_id,)).fetchone()
+            if row is None:
+                raise KeyError(stable_id)
+            partition_count = db.execute(
+                "SELECT COUNT(*) AS count FROM partition_incarnations WHERE disk_stable_id = ?",
+                (stable_id,),
+            ).fetchone()["count"]
+            attempt_count = db.execute(
+                "SELECT COUNT(*) AS count FROM index_attempts WHERE stable_id = ?", (stable_id,)
+            ).fetchone()["count"]
+            db.execute("DELETE FROM partition_incarnations WHERE disk_stable_id = ?", (stable_id,))
+            db.execute("DELETE FROM index_attempts WHERE stable_id = ?", (stable_id,))
+            db.execute("DELETE FROM disks WHERE stable_id = ?", (stable_id,))
+        return {
+            "stableId": stable_id,
+            "partitionRecordsRemoved": partition_count,
+            "indexAttemptsRemoved": attempt_count,
+        }
+
     def get_partition(self, incarnation_id: str) -> dict[str, Any]:
         with self.connect() as db:
             row = db.execute(

@@ -69,3 +69,7 @@ Cadastre inventory selection is partition-level. Supported filesystems are ext2,
 The preferred identity is disk stable ID plus filesystem UUID. If UUID is absent, Cadastre uses disk stable ID plus PARTUUID, then partition number/path as a deterministic degraded fallback requiring explicit confirmation. Reformatting to a new filesystem UUID creates a distinct record. A new incarnation in the same partition slot marks its prior incarnation `replaced` and records `replaces`/`replacedBy`. Historical rows are retained. Duplicate filesystem UUIDs discovered concurrently are ambiguous and cannot be added.
 
 The additive `partition_incarnations` table is created with `CREATE TABLE IF NOT EXISTS`; existing whole-disk `disks` and `index_attempts` rows remain readable. `GET /api/disks` returns both `disks` and `partitions`; `POST /api/partitions` accepts `diskStableId`, freshly discovered `incarnationIds`, and explicit confirmation flags when required.
+
+### Remove from inventory
+
+`DELETE /api/disks/{stableId}` removes only the trusted persisted Cadastre disk row and its associated partition-incarnation and index-attempt history in one SQLite transaction. An absent ID returns `404 INVENTORY_DISK_NOT_FOUND`. It invokes no disk command and does not unmount, write, format, wipe, delete, or otherwise modify the physical disk/filesystems. The disk can be discovered and added again. Inventory-record removal is not undoable in MVP0 and requires explicit UI confirmation.

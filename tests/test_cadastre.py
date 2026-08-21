@@ -366,5 +366,70 @@ class PartitionApiTests(unittest.TestCase):
                 self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
 
 
+class InventoryRemovalTests(unittest.TestCase):
+    def test_remove_and_cancel_contract(self):
+        with tempfile.TemporaryDirectory() as folder, patch("subprocess.run") as shell:
+            store = Store(Path(folder) / "test.db")
+            store.initialize()
+            disk = {
+                "stableId": "disk-1",
+                "device": "/dev/sdb",
+                "brand": "Acme",
+                "model": "Archive",
+                "sizeBytes": 9,
+                "serial": "disk-1",
+                "partitionTable": "gpt",
+                "filesystems": ["ext4"],
+                "smartStatus": "unavailable",
+                "smartDetail": None,
+                "transport": "usb",
+                "removable": True,
+                "readOnly": False,
+            }
+            part = {
+                "device": "/dev/sdb1",
+                "name": "sdb1",
+                "number": 1,
+                "partuuid": "slot",
+                "filesystem": "ext4",
+                "filesystemUuid": "fs1",
+                "sizeBytes": 9,
+                "identityConfidence": "high",
+                "incarnationId": "disk-1:fsuuid:fs1",
+            }
+            store.add_partition(disk, part)
+            removed = store.remove_disk("disk-1")
+            self.assertEqual(removed["partitionRecordsRemoved"], 1)
+            self.assertEqual(store.list_disks(), [])
+            self.assertEqual(store.list_partitions(), [])
+            shell.assert_not_called()
+            with self.assertRaises(KeyError):
+                store.remove_disk("absent")
+        source = (Path(__file__).parent.parent / "static" / "app.js").read_text()
+        self.assertIn("function removalConfirmed", source)
+        self.assertIn("if(!removalConfirmed(event.target.returnValue)||!pendingRemoval)", source)
+        html = (Path(__file__).parent.parent / "static" / "index.html").read_text()
+        self.assertIn("Remove from inventory", html)
+        self.assertIn("not undoable in MVP0", html)
+
+
+class InventoryRemovalApiTests(unittest.TestCase):
+    def test_absent_disk_returns_404(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server = create_server("127.0.0.1", 0, str(Path(folder) / "test.db"))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/disks/absent", method="DELETE")
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request)
+                self.assertEqual(raised.exception.code, 404)
+                self.assertEqual(json.load(raised.exception)["error"]["code"], "INVENTORY_DISK_NOT_FOUND")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+
 if __name__ == "__main__":
     unittest.main()

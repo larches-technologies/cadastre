@@ -92,6 +92,21 @@ def create_server(host: str = "127.0.0.1", port: int = 8741, db_path: str = "dat
             self.end_headers()
             self.wfile.write(body)
 
+        def do_DELETE(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            prefix = "/api/disks/"
+            if not parsed.path.startswith(prefix) or not parsed.path[len(prefix) :]:
+                self.error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Route not found")
+                return
+            from urllib.parse import unquote
+
+            stable_id = unquote(parsed.path[len(prefix) :])
+            try:
+                removed = store.remove_disk(stable_id)
+                self.json_response(HTTPStatus.OK, {"removed": removed})
+            except KeyError:
+                self.error_response(HTTPStatus.NOT_FOUND, "INVENTORY_DISK_NOT_FOUND", "Inventory disk not found")
+
         def do_POST(self) -> None:  # noqa: N802
             if urlparse(self.path).path != "/api/partitions":
                 self.error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Route not found")
