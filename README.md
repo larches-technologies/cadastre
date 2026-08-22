@@ -2,6 +2,10 @@
 
 Cadastre MVP0 is a local, read-only inventory for offline disks. It enumerates physical host disks, requires an explicit operator selection, stores observed metadata in SQLite, and presents it in a dual-theme Larches operator UI.
 
+## Resumable indexing
+
+See [docs/indexing.md](docs/indexing.md) for identity validation, SQLite/Parquet storage, crash semantics, cooperative controls, growth, and deferred work.
+
 ## Safety model
 
 Cadastre inventory **observes only**. The separate Connected devices workflow can explicitly mount supported external partitions read-only, browse verified read-only mounts, unmount after confirmation, and safely power off eligible physical disks. It never requests read-write access, hashes files, wipes, formats, repairs, or deletes source data. System disks are protected from lifecycle actions.
