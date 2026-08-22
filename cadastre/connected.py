@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ from cadastre.discovery import discover_disks
 UDISKSCTL = "/usr/bin/udisksctl"
 FUSER = "/usr/bin/fuser"
 MOUNT_OPTIONS = "ro"
+BROWSE_ENTRY_LIMIT = 500
+PREVIEW_BYTE_LIMIT = 262144
 LOG = logging.getLogger("cadastre.actions")
 
 
@@ -320,7 +323,7 @@ class ConnectedDevices:
         }
 
     def _open_target(self, device, relative, directory):
-        _, part = self.target(device=device)
+        disk, part = self.target(device=device)
         if not part["mountpoint"] or self.mount_state(device, part["mountpoint"]) != "ro":
             raise ActionError(
                 "BROWSE_REQUIRES_READ_ONLY",
@@ -340,51 +343,114 @@ class ConnectedDevices:
                 child = os.open(component, child_flags, dir_fd=fd)
                 os.close(fd)
                 fd = child
-            return fd
+            fresh_disk, fresh_part = self.target(device=device)
+            if (
+                fresh_disk.get("stableId") != disk.get("stableId")
+                or fresh_part.get("mountpoint") != part.get("mountpoint")
+                or self.mount_state(device, fresh_part.get("mountpoint")) != "ro"
+            ):
+                raise ActionError("TARGET_STALE", "Device or verified read-only mount changed during access")
+            return fd, fresh_disk, fresh_part
+        except ActionError:
+            if fd is not None:
+                os.close(fd)
+            raise
         except OSError as exc:
             if fd is not None:
                 os.close(fd)
             raise ActionError("PATH_NOT_SAFE", "Path is absent, inaccessible, or crosses a symlink", 400) from exc
 
+    @staticmethod
+    def _browser_context(disk, part, relative):
+        return {
+            "disk": {
+                "brand": disk.get("brand") or "Unknown",
+                "model": disk.get("model") or "Unknown model",
+                "serial": disk.get("serial") or "Unavailable",
+                "stableId": disk.get("stableId") or "Unavailable",
+            },
+            "partition": {
+                "device": part["device"],
+                "filesystem": part.get("filesystem") or "Unknown",
+                "filesystemLabel": part.get("filesystemLabel"),
+                "filesystemUuid": part.get("filesystemUuid"),
+                "mountpoint": part["mountpoint"],
+                "mountState": "ro",
+            },
+            "relativePath": relative,
+        }
+
     def browse(self, device, relative=""):
-        fd = self._open_target(device, relative, True)
+        fd, disk, part = self._open_target(device, relative, True)
         entries = []
         truncated = False
         try:
             with os.scandir(fd) as scan:
                 for item in scan:
-                    if len(entries) >= 500:
+                    if len(entries) >= BROWSE_ENTRY_LIMIT:
                         truncated = True
                         break
-                    info = item.stat(follow_symlinks=False)
+                    try:
+                        info = item.stat(follow_symlinks=False)
+                        modified = datetime.fromtimestamp(info.st_mtime, UTC).isoformat()
+                    except (OSError, OverflowError, ValueError):
+                        info = None
+                        modified = None
                     entries.append(
                         {
                             "name": item.name,
-                            "type": file_type(info.st_mode),
-                            "sizeBytes": info.st_size,
-                            "mtime": datetime.fromtimestamp(info.st_mtime, UTC).isoformat(),
-                            "readable": stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode),
+                            "type": file_type(info.st_mode) if info else "unavailable",
+                            "sizeBytes": info.st_size if info else None,
+                            "modifiedAt": modified,
+                            "readable": bool(info and (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))),
                         }
                     )
         finally:
             os.close(fd)
-        return {"path": relative, "entries": entries, "truncated": truncated}
+        return {
+            "path": relative,
+            "context": self._browser_context(disk, part, relative),
+            "entries": entries,
+            "truncated": truncated,
+            "entryLimit": BROWSE_ENTRY_LIMIT,
+        }
 
     def preview(self, device, relative):
-        fd = self._open_target(device, relative, False)
+        fd, disk, part = self._open_target(device, relative, False)
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
                 raise ActionError("PREVIEW_NOT_REGULAR", "Only regular files can be previewed", 400)
-            if info.st_size > 262144:
-                raise ActionError("PREVIEW_TOO_LARGE", "Preview limited to 256 KiB", 413)
-            data = os.read(fd, 262145)
+            chunks = []
+            remaining = PREVIEW_BYTE_LIMIT
+            while remaining:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
         finally:
             os.close(fd)
-        if len(data) > 262144:
-            raise ActionError("PREVIEW_TOO_LARGE", "Preview limited to 256 KiB", 413)
+        truncated = info.st_size > len(data)
         try:
-            text = data.decode("utf-8")
+            if truncated:
+                decoder = codecs.getincrementaldecoder("utf-8")()
+                text = decoder.decode(data, final=False)
+                buffered, _ = decoder.getstate()
+                shown = len(data) - len(buffered)
+            else:
+                text = data.decode("utf-8")
+                shown = len(data)
         except UnicodeDecodeError as exc:
             raise ActionError("PREVIEW_NOT_UTF8", "Binary or non-UTF-8 preview rejected", 415) from exc
-        return {"path": relative, "text": text, "sizeBytes": len(data)}
+        return {
+            "path": relative,
+            "context": self._browser_context(disk, part, relative),
+            "text": text,
+            "bytesShown": shown,
+            "totalSizeBytes": info.st_size,
+            "truncated": truncated,
+            "complete": not truncated,
+            "previewByteLimit": PREVIEW_BYTE_LIMIT,
+        }

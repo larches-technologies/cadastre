@@ -20,6 +20,8 @@ def part(device="/dev/sdz1", mountpoint=None, supported=True, ambiguous=False):
         "supported": supported,
         "identityAmbiguous": ambiguous,
         "filesystem": "ext4",
+        "filesystemLabel": "ARCHIVE",
+        "filesystemUuid": "abcd-1234",
         "sizeBytes": 1,
     }
 
@@ -28,6 +30,9 @@ def disk(partition=None, **overrides):
     value = {
         "stableId": "usb-1",
         "device": "/dev/sdz",
+        "brand": "Example",
+        "model": "Vault",
+        "serial": "SERIAL-1",
         "isSystem": False,
         "removable": True,
         "hotplug": True,
@@ -197,8 +202,18 @@ class BrowserContainmentTests(unittest.TestCase):
 
     def test_nested_listing_and_preview(self):
         listing = self.connected.browse("/dev/sdz1", "nested")
-        self.assertEqual(listing["entries"][0]["name"], "hello.txt")
-        self.assertEqual(self.connected.preview("/dev/sdz1", "nested/hello.txt")["text"], "hello")
+        entry = listing["entries"][0]
+        self.assertEqual(entry["name"], "hello.txt")
+        self.assertRegex(entry["modifiedAt"], r"[+-]00:00$")
+        self.assertNotIn("mtime", entry)
+        self.assertEqual(listing["context"]["disk"]["stableId"], "usb-1")
+        self.assertEqual(listing["context"]["partition"]["device"], "/dev/sdz1")
+        self.assertEqual(listing["context"]["partition"]["mountState"], "ro")
+        preview = self.connected.preview("/dev/sdz1", "nested/hello.txt")
+        self.assertEqual(preview["text"], "hello")
+        self.assertTrue(preview["complete"])
+        self.assertFalse(preview["truncated"])
+        self.assertEqual((preview["bytesShown"], preview["totalSizeBytes"]), (5, 5))
 
     def test_absolute_nul_and_parent_rejected(self):
         for value in ["/etc", "a\x00b", "../etc", "a/../../etc"]:
@@ -238,13 +253,18 @@ class BrowserContainmentTests(unittest.TestCase):
         self.assertEqual(len(listing["entries"]), 500)
         self.assertTrue(listing["truncated"])
 
-    def test_preview_size_cap_and_invalid_utf8(self):
+    def test_preview_size_cap_is_head_only_and_invalid_utf8_refused(self):
         (self.root / "large").write_bytes(b"x" * 262145)
+        preview = self.connected.preview("/dev/sdz1", "large")
+        self.assertTrue(preview["truncated"])
+        self.assertFalse(preview["complete"])
+        self.assertEqual(preview["bytesShown"], 262144)
+        self.assertEqual(preview["totalSizeBytes"], 262145)
+        self.assertEqual(len(preview["text"]), 262144)
         (self.root / "binary").write_bytes(b"\xff")
-        for name, code in [("large", "PREVIEW_TOO_LARGE"), ("binary", "PREVIEW_NOT_UTF8")]:
-            with self.subTest(name=name), self.assertRaises(ActionError) as raised:
-                self.connected.preview("/dev/sdz1", name)
-            self.assertEqual(raised.exception.code, code)
+        with self.assertRaises(ActionError) as raised:
+            self.connected.preview("/dev/sdz1", "binary")
+        self.assertEqual(raised.exception.code, "PREVIEW_NOT_UTF8")
 
 
 class FakeConnected:
@@ -348,6 +368,24 @@ class ApiSecurityTests(unittest.TestCase):
             response = urllib.request.urlopen(self.base + path)
             self.assertEqual(response.status, 200)
             self.assertEqual(response.read(), root)
+
+    def test_ui_contract_uses_accessible_distinct_dialogs_and_semantic_links(self):
+        html = urllib.request.urlopen(self.base + "/").read().decode()
+        script = urllib.request.urlopen(self.base + "/app.js").read().decode()
+        self.assertIn('id="browser-dialog"', html)
+        self.assertIn('aria-labelledby="browser-title"', html)
+        self.assertIn('id="preview-dialog"', html)
+        self.assertIn('aria-labelledby="preview-title"', html)
+        self.assertIn('<a class="button secondary" href="#browse"', script)
+        self.assertIn('<a href="#directory" data-dir=', script)
+        self.assertIn('<a href="#preview" data-preview=', script)
+        self.assertNotIn("Preview text</button>", script)
+        self.assertIn("function modified(value)", script)
+        self.assertIn("Truncated preview.", script)
+        self.assertIn("Complete preview.", script)
+        self.assertIn("content.textContent=d.text", script)
+        self.assertIn("origin.focus()", script)
+        self.assertIn("previewOrigin.focus()", script)
 
     def test_missing_invalid_token_and_invalid_origin(self):
         self.assertEqual(self.error("/api/connected/mount", payload={"confirmed": True}), (401, "ACTION_TOKEN_REQUIRED"))

@@ -88,6 +88,7 @@ def _partitions(node: dict[str, Any], disk_stable_id: str) -> list[dict[str, Any
                     "sizeBytes": int(child.get("size") or 0),
                     "startBytes": int(child.get("start") or 0),
                     "filesystem": filesystem,
+                    "filesystemLabel": child.get("label") or None,
                     "filesystemUuid": filesystem_uuid,
                     "mountpoint": mountpoints[0] if mountpoints else None,
                     "readOnly": bool(child.get("ro")),
@@ -153,7 +154,7 @@ def discover_disks(runner: Runner = subprocess.run) -> DiscoveryResult:
     """Enumerate physical disks without mounting or traversing their contents."""
     if not shutil.which("lsblk"):
         raise DiscoveryError("lsblk is required but was not found")
-    columns = "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,UUID,PARTUUID,PARTN,START,MOUNTPOINTS,RM,HOTPLUG,RO,TRAN"  # noqa: E501
+    columns = "NAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,PTTYPE,FSTYPE,LABEL,UUID,PARTUUID,PARTN,START,MOUNTPOINTS,RM,HOTPLUG,RO,TRAN"  # noqa: E501
     result = _run(["lsblk", "--json", "--bytes", "--output", columns], runner)
     if result.returncode:
         detail = result.stderr.strip() or f"exit {result.returncode}"
