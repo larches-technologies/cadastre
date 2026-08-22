@@ -81,7 +81,8 @@ def create_server(
                 self.json_response(200, {"actionToken": action_token})
             elif parsed.path == "/api/connected":
                 try:
-                    disks = connected.live()
+                    include_system = parse_qs(parsed.query).get("includeSystem", ["false"])[0].lower() == "true"
+                    disks = filter_system_disks(connected.live(), include_system)
                 except (DiscoveryError, ActionError) as exc:
                     self.error_response(getattr(exc, "status", 503), getattr(exc, "code", "DISCOVERY_FAILED"), str(exc))
                     return

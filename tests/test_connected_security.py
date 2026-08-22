@@ -272,7 +272,7 @@ class FakeConnected:
         self.calls = []
 
     def live(self):
-        return [disk(part())]
+        return [disk(part()), disk(part("/dev/sdy1"), stableId="system-1", device="/dev/sdy", isSystem=True)]
 
     def browse(self, device, path):
         return {"path": path, "entries": [], "truncated": False}
@@ -329,6 +329,12 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertEqual(json.load(urllib.request.urlopen(self.base + "/health"))["status"], "ready")
         self.assertEqual(len(json.load(urllib.request.urlopen(self.base + "/api/connected"))["disks"]), 1)
         self.assertIn(b"CONNECTED DEVICES", urllib.request.urlopen(self.base + "/").read())
+
+    def test_connected_system_disks_require_explicit_opt_in(self):
+        default = json.load(urllib.request.urlopen(self.base + "/api/connected"))
+        opted_in = json.load(urllib.request.urlopen(self.base + "/api/connected?includeSystem=true"))
+        self.assertEqual([item["stableId"] for item in default["disks"]], ["usb-1"])
+        self.assertEqual([item["stableId"] for item in opted_in["disks"]], ["usb-1", "system-1"])
 
     def test_connected_membership_uses_exact_stable_id_and_refreshes(self):
         first = json.load(urllib.request.urlopen(self.base + "/api/connected"))["disks"][0]
@@ -473,3 +479,9 @@ class ConnectedUiContractTests(unittest.TestCase):
         self.assertIn('data-view="connected"', html)
         self.assertGreaterEqual(html.count('data-view="inventory"'), 3)
         self.assertIn("await inventory();await connected()", js)
+        self.assertIn('for="show-connected-system"', html)
+        self.assertIn('<input type="checkbox" id="show-connected-system"> Show system drives', html)
+        self.assertNotIn('id="show-connected-system" checked', html)
+        self.assertIn("req('/api/connected?includeSystem='+$('#show-connected-system').checked)", js)
+        self.assertIn("$('#refresh-connected').onclick=connected", js)
+        self.assertIn("$('#show-connected-system').onchange=connected", js)
