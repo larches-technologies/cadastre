@@ -89,3 +89,7 @@ Unmount requires confirmation and applies to freshly verified non-system removab
 The browser is read-only and one-level-per-request. It performs descriptor-relative, `O_NOFOLLOW` traversal, rejects absolute/NUL/parent paths and symlink traversal, labels symlinks and special files, never opens devices/FIFOs/sockets, caps listings at 500 entries, and offers UTF-8 regular-file preview only up to 256 KiB. There is no download, recursive walk, index, hash, search, or thumbnail generation.
 
 The HTTP service remains loopback-only. Every state-changing API, including inventory removal, requires a per-process action token and rejects cross-origin browser requests. The token is supplied to the local UI in a no-store session response and is not logged.
+
+### Indexing workspace
+
+Browse to `/indexing` to start and supervise metadata-only generations from server-authoritative connected inventory filesystems, inspect truthful lifecycle/quiescence states, and run bounded metadata search. See `docs/indexing.md` for workflow and limitations.

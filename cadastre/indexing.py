@@ -522,7 +522,18 @@ class IndexQuery:
             if fragments
             else []
         )
-        return {"partial": bool(generation["is_partial"]), "counts": counts}
+        largest = (
+            self._execute(
+                """SELECT relative_path,size_bytes FROM read_parquet(?)
+                WHERE entry_type='file' AND size_bytes IS NOT NULL
+                ORDER BY size_bytes DESC,relative_path LIMIT 10""",
+                ([str(path) for path in fragments],),
+                timeout_seconds,
+            )
+            if fragments
+            else []
+        )
+        return {"partial": bool(generation["is_partial"]), "counts": counts, "largestFiles": largest}
 
     @staticmethod
     def _execute(sql: str, parameters: Sequence[Any], timeout_seconds: float) -> list[dict[str, Any]]:

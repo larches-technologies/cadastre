@@ -29,3 +29,13 @@ The local server adds a non-blocking single-worker supervisor with persisted lea
 Routes are `GET /api/indexes`, `GET /api/indexes/{id}`, `POST /api/indexes/start`, `POST /api/indexes/{id}/pause|resume|stop`, `GET /api/indexes/{id}/search`, and `GET /api/indexes/{id}/summary`. Existing same-origin action-token protection applies to writes. Resume ignores client identity and mount claims: fresh ConnectedDevices discovery must match persisted disk stable ID, lineage, filesystem UUID, and an authorized read-only mount. Related unmount/eject/inventory removal fails closed with `INDEX_ACTIVE` until server-side quiescence is confirmed.
 
 Phase 2B owns UI, deployment/restart, retention, and fragment compaction.
+
+## Operator workflow (Phase 2B)
+
+Open `/indexing`. Select an inventory filesystem that the server has independently matched to current connected-device discovery and verified as browseable at a read-only mount. The browser submits only its stable inventory incarnation ID; the server derives disk identity, persisted lineage, and filesystem UUID and revalidates the live mount before starting.
+
+Start returns immediately while the worker continues in the background. Generation cards report observed entries/files/directories/errors, current relative path, elapsed time, exact lifecycle state, and whether the worker is quiesced. No completion percentage is estimated. Pause, Resume, and Stop are enabled only for compatible states. Partial, interrupted, waiting-for-remount, failed, completed, and completed-with-errors outcomes remain distinct.
+
+Select a generation to load its metadata summary and run a bounded name search (maximum 200 results). Search is parameterized and exposes metadata only: no arbitrary SQL, arbitrary source path, or file-content preview. Polling stops when the page is hidden, aborts stale requests, and does not overlap refreshes.
+
+Limitations: indexing requires an already mounted, server-verified read-only filesystem. Progress cannot predict remaining work. Summary/search cover only committed fragments and truthfully mark partial generations. Retention and compaction remain deferred.
