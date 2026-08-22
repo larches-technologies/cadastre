@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import json
 import logging
+import mimetypes
 import os
 import stat
 import subprocess
@@ -20,6 +21,7 @@ FUSER = "/usr/bin/fuser"
 MOUNT_OPTIONS = "ro"
 BROWSE_ENTRY_LIMIT = 500
 PREVIEW_BYTE_LIMIT = 262144
+HEX_PREVIEW_BYTE_LIMIT = 256
 LOG = logging.getLogger("cadastre.actions")
 
 
@@ -442,11 +444,37 @@ class ConnectedDevices:
             else:
                 text = data.decode("utf-8")
                 shown = len(data)
-        except UnicodeDecodeError as exc:
-            raise ActionError("PREVIEW_NOT_UTF8", "Binary or non-UTF-8 preview rejected", 415) from exc
+        except UnicodeDecodeError:
+            head = data[:HEX_PREVIEW_BYTE_LIMIT]
+            mime, _encoding = mimetypes.guess_type(relative, strict=False)
+            mime_source = "filename extension" if mime else "default"
+            mime = mime or "application/octet-stream"
+            lines = []
+            for offset in range(0, len(head), 16):
+                chunk = head[offset : offset + 16]
+                hexadecimal = " ".join(f"{byte:02x}" for byte in chunk)
+                ascii_text = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in chunk)
+                lines.append(f"{offset:08x}  {hexadecimal:<47}  |{ascii_text:<16}|")
+            shown = len(head)
+            return {
+                "path": relative,
+                "context": self._browser_context(disk, part, relative),
+                "previewType": "hex",
+                "mimeType": mime,
+                "mimeSource": mime_source,
+                "text": "\n".join(lines),
+                "bytesShown": shown,
+                "totalSizeBytes": info.st_size,
+                "truncated": info.st_size > shown,
+                "complete": info.st_size == shown,
+                "previewByteLimit": HEX_PREVIEW_BYTE_LIMIT,
+            }
         return {
             "path": relative,
             "context": self._browser_context(disk, part, relative),
+            "previewType": "text",
+            "mimeType": "text/plain; charset=utf-8",
+            "mimeSource": "decoded UTF-8",
             "text": text,
             "bytesShown": shown,
             "totalSizeBytes": info.st_size,

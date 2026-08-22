@@ -39,6 +39,9 @@ def create_server(
         raise ValueError("Simulation mode cannot mix injected or real connected devices")
     connected = SimulatedDevices() if simulated else (connected_devices or ConnectedDevices())
     discoverer = discover_simulated if simulated else discover_disks
+    if simulated:
+        browseable = next(disk for disk in discoverer().disks if disk["stableId"] == "sim-disk-browseable")
+        store.add_partition(browseable, browseable["partitions"][0])
     index_store = IndexStore(db_path)
     index_store.initialize()
     supervisor = index_supervisor or IndexSupervisor(index_store, connected)
@@ -166,7 +169,7 @@ def create_server(
                 self.serve_file(STATIC / "index.html", "text/html; charset=utf-8")
             elif parsed.path == "/app.css":
                 self.serve_file(STATIC / "app.css", "text/css; charset=utf-8")
-            elif parsed.path in {"/app.js", "/indexing.js", "/file-presentation.js"}:
+            elif parsed.path in {"/app.js", "/indexing.js", "/file-presentation.js", "/index-targets.js"}:
                 self.serve_file(STATIC / parsed.path.lstrip("/"), "text/javascript; charset=utf-8")
             else:
                 self.error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Route not found")

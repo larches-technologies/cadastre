@@ -28,6 +28,7 @@ class FakeConnected:
                         "mountpoint": str(self.root),
                         "mountState": "ro",
                         "browseAllowed": True,
+                        "supported": True,
                     }
                 ],
             }

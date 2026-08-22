@@ -34,6 +34,8 @@ class IndexSupervisor:
         disk = next((item for item in disks if item.get("stableId") == identity.disk_stable_id), None)
         if disk is None:
             raise IndexingError("REMOUNT_UNAVAILABLE", "The indexed disk is not connected")
+        if disk.get("isSystem"):
+            raise IndexingError("TARGET_INELIGIBLE", "Protected system disks cannot be indexed")
         candidates = [
             part
             for part in disk.get("partitions", [])
@@ -41,10 +43,12 @@ class IndexSupervisor:
             or part.get("lineage_id") == identity.lineage_id
             or part.get("incarnationId") == identity.lineage_id
         ]
-        if not candidates:
-            raise IndexingError("IDENTITY_MISMATCH", "Persisted partition lineage is not present")
+        if len(candidates) != 1:
+            raise IndexingError("IDENTITY_MISMATCH", "Persisted partition lineage is absent or ambiguous")
         part = candidates[0]
-        if part.get("filesystemUuid") != identity.filesystem_uuid:
+        if not part.get("supported") or part.get("identityAmbiguous") or part.get("requiresIdentityConfirmation"):
+            raise IndexingError("TARGET_INELIGIBLE", "Filesystem is unsupported or its identity is ambiguous")
+        if not part.get("filesystemUuid") or part.get("filesystemUuid") != identity.filesystem_uuid:
             raise IndexingError("IDENTITY_MISMATCH", "Filesystem UUID does not match the indexed generation")
         root = part.get("mountpoint")
         if not root or part.get("mountState") != "ro" or not part.get("browseAllowed"):

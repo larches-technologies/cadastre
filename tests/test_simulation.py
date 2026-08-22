@@ -76,6 +76,12 @@ class SimulationServerTests(unittest.TestCase):
         _, connected = self.get("/api/connected?includeSystem=true")
         self.assertTrue(connected["provenance"]["simulated"])
         self.assertEqual(len(connected["disks"]), 5)
+        _, inventory = self.get("/api/disks")
+        browseable = next(disk for disk in inventory["disks"] if disk["stableId"] == "sim-disk-browseable")
+        self.assertEqual(
+            browseable["partitions"][0]["incarnationId"],
+            "sim-disk-browseable:fsuuid:sim-fsuuid-browseable",
+        )
         with urllib.request.urlopen(self.base + "/") as response:
             page = response.read().decode()
         self.assertIn("SIMULATED DISK MODE", page)
@@ -104,6 +110,8 @@ class SimulationServerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as raised:
             urllib.request.urlopen(request)
         self.assertEqual(raised.exception.code, 409)
+        body = json.loads(raised.exception.read())
+        self.assertEqual(body["error"]["code"], "SIMULATION_INDEX_UNAVAILABLE")
 
 
 if __name__ == "__main__":
