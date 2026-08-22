@@ -93,3 +93,21 @@ The HTTP service remains loopback-only. Every state-changing API, including inve
 ### Indexing workspace
 
 Browse to `/indexing` to start and supervise metadata-only generations from server-authoritative connected inventory filesystems, inspect truthful lifecycle/quiescence states, and run bounded metadata search. See `docs/indexing.md` for workflow and limitations.
+
+## Safe simulated-disk mode
+
+Cadastre has an explicit, default-off development mode for UI/API exercises. Start it from the repository root with an isolated simulation database:
+
+```sh
+uv run cadastre serve --simulate-disks --db .runtime/cadastre-simulation.db
+```
+
+Open `http://127.0.0.1:8741`. A red **SIMULATED DISK MODE** banner is always shown, API objects carry `provenance.mode = "simulated"`, and responses carry `X-Cadastre-Provenance: simulated`. Stop it with `Ctrl-C`. Optionally remove only the isolated database afterward:
+
+```sh
+rm -f .runtime/cadastre-simulation.db .runtime/cadastre-simulation.db-shm .runtime/cadastre-simulation.db-wal
+```
+
+Safety boundary: simulation selects a separate in-memory provider before discovery/lifecycle wiring. It never constructs the real `ConnectedDevices` provider and has no subprocess runner, `/dev` path, mount syscall, or host filesystem root. Fixtures and lifecycle state exist only in process memory; inventory records use the explicitly isolated SQLite file. Normal `cadastre serve` remains real mode and unchanged. Never point simulated mode at the production database.
+
+Deterministic fixtures cover a normal USB disk, protected system disk, unsupported filesystem, ambiguous identity, and an already-mounted read-only browse/preview fixture. Simulated indexing is intentionally rejected: the real index engine requires a verified host `Path`, so enabling it would weaken the isolation boundary. Ejected/mounted state resets when the process stops. This mode does not emulate kernel, udev, SMART, mount timing, permissions, media failure, or real filesystem behavior.

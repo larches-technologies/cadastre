@@ -18,11 +18,12 @@ def main() -> None:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8741)
     serve.add_argument("--db", default=None)
+    serve.add_argument("--simulate-disks", action="store_true", help="use isolated deterministic SIMULATED disks")
     discover = sub.add_parser("discover", help="print live read-only disk metadata")
     discover.add_argument("--include-system", action="store_true")
     args = parser.parse_args()
     if args.command == "serve":
-        run(args.host, args.port, args.db)
+        run(args.host, args.port, args.db, simulated=args.simulate_disks)
     else:
         try:
             result = discover_disks()

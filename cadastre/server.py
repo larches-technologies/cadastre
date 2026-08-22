@@ -15,6 +15,7 @@ from cadastre import __version__
 from cadastre.connected import ActionError, ConnectedDevices
 from cadastre.discovery import DiscoveryError, discover_disks, filter_system_disks
 from cadastre.indexing import FilesystemIdentity, IndexingError, IndexQuery, IndexStore
+from cadastre.simulation import PROVENANCE, SimulatedDevices, discover_simulated
 from cadastre.store import Store
 from cadastre.supervisor import IndexSupervisor
 
@@ -28,12 +29,16 @@ def create_server(
     db_path: str = "data/cadastre.db",
     connected_devices: ConnectedDevices | None = None,
     index_supervisor: IndexSupervisor | None = None,
+    simulated: bool = False,
 ) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("Cadastre MVP0 only permits a local-only bind")
     store = Store(db_path)
     store.initialize()
-    connected = connected_devices or ConnectedDevices()
+    if simulated and connected_devices is not None:
+        raise ValueError("Simulation mode cannot mix injected or real connected devices")
+    connected = SimulatedDevices() if simulated else (connected_devices or ConnectedDevices())
+    discoverer = discover_simulated if simulated else discover_disks
     index_store = IndexStore(db_path)
     index_store.initialize()
     supervisor = index_supervisor or IndexSupervisor(index_store, connected)
@@ -46,11 +51,14 @@ def create_server(
             LOG.info(fmt, *args)
 
         def json_response(self, status: int, data: object) -> None:
+            if simulated and isinstance(data, dict):
+                data = {**data, "provenance": PROVENANCE.copy()}
             body = json.dumps(data).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Cadastre-Provenance", "simulated" if simulated else "real")
             self.end_headers()
             self.wfile.write(body)
 
@@ -75,10 +83,10 @@ def create_server(
             if parsed.path in {"/health", "/ready"}:
                 self.json_response(
                     HTTPStatus.OK,
-                    {"status": "ready", "version": __version__, "scope": "local-read-only"},
+                    {"status": "ready", "version": __version__, "scope": "local-read-only", "simulation": simulated},
                 )
             elif parsed.path == "/api/session":
-                self.json_response(200, {"actionToken": action_token})
+                self.json_response(200, {"actionToken": action_token, "simulation": simulated})
             elif parsed.path == "/api/connected":
                 try:
                     include_system = parse_qs(parsed.query).get("includeSystem", ["false"])[0].lower() == "true"
@@ -136,7 +144,7 @@ def create_server(
                     self.index_error(exc)
             elif parsed.path == "/api/discovery":
                 try:
-                    result = discover_disks()
+                    result = discoverer()
                     include_system = parse_qs(parsed.query).get("includeSystem", ["false"])[0].lower() == "true"
                     disks = filter_system_disks(result.disks, include_system)
                     self.json_response(
@@ -169,6 +177,7 @@ def create_server(
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Cadastre-Provenance", "simulated" if simulated else "real")
             self.end_headers()
             self.wfile.write(body)
 
@@ -205,6 +214,13 @@ def create_server(
                 return
             action_path = urlparse(self.path).path
             if action_path.startswith("/api/indexes"):
+                if simulated:
+                    self.error_response(
+                        409,
+                        "SIMULATION_INDEX_UNAVAILABLE",
+                        "Simulated indexing is disabled to prevent host filesystem access",
+                    )
+                    return
                 try:
                     payload = self.request_json()
                     if action_path == "/api/indexes/start":
@@ -276,7 +292,7 @@ def create_server(
                         "Select at least one eligible discovered partition",
                     )
                     return
-                result = discover_disks()
+                result = discoverer()
                 disk = next((item for item in result.disks if item["stableId"] == disk_id), None)
                 if disk is None:
                     self.error_response(HTTPStatus.CONFLICT, "DEVICE_NOT_PRESENT", "Disk is no longer present; rescan")
@@ -336,11 +352,22 @@ def create_server(
     return ThreadingHTTPServer((host, port), Handler)
 
 
-def run(host: str = "127.0.0.1", port: int = 8741, db_path: str | None = None) -> None:
+def run(host: str = "127.0.0.1", port: int = 8741, db_path: str | None = None, *, simulated: bool = False) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    path = db_path or os.environ.get("CADASTRE_DB", "data/cadastre.db")
-    server = create_server(host, port, path)
-    LOG.info("Cadastre %s listening on http://%s:%s (database=%s)", __version__, host, port, path)
+    path = (
+        (db_path or "data/cadastre-simulation.db")
+        if simulated
+        else (db_path or os.environ.get("CADASTRE_DB", "data/cadastre.db"))
+    )
+    server = create_server(host, port, path, simulated=simulated)
+    LOG.info(
+        "Cadastre %s listening on http://%s:%s (database=%s mode=%s)",
+        __version__,
+        host,
+        port,
+        path,
+        "SIMULATED" if simulated else "real",
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
