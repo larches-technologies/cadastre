@@ -9,13 +9,13 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import duckdb
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_QUERY_LIMIT = 200
 MAX_ERROR_DETAIL = 1000
 RESUMABLE_STATES = ("paused", "interrupted", "waiting_for_media")
@@ -29,6 +29,10 @@ class IndexingError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _lease_time() -> str:
+    return (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
 
 
 def _relative_text(value: str | PurePosixPath) -> str:
@@ -77,13 +81,15 @@ class IndexStore:
         return db
 
     def initialize(self) -> None:
-        """Add schema v4 without changing v1-v3 inventory rows."""
+        """Add/reconcile indexing schema without changing v1-v3 inventory rows."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.fragment_root.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise RuntimeError(f"database schema {version} is newer than supported {SCHEMA_VERSION}")
+            if version == 4:
+                self._migrate_v4(db)
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS index_generations (
@@ -93,8 +99,8 @@ class IndexStore:
                     filesystem_uuid TEXT NOT NULL,
                     source_root TEXT NOT NULL,
                     state TEXT NOT NULL CHECK (state IN (
-                        'running','pause_requested','paused','stop_requested','stopped',
-                        'interrupted','waiting_for_media','completed','failed'
+                        'queued','starting','running','pause_requested','paused','waiting_for_remount',
+                        'stopping','stopped','interrupted','completed','completed_with_errors','failed'
                     )),
                     is_partial INTEGER NOT NULL DEFAULT 1 CHECK (is_partial IN (0,1)),
                     control TEXT CHECK (control IN ('pause','stop') OR control IS NULL),
@@ -108,11 +114,13 @@ class IndexStore:
                     files_seen INTEGER NOT NULL DEFAULT 0 CHECK (files_seen >= 0),
                     directories_seen INTEGER NOT NULL DEFAULT 0 CHECK (directories_seen >= 0),
                     logical_bytes INTEGER NOT NULL DEFAULT 0 CHECK (logical_bytes >= 0),
-                    detail TEXT
+                    detail TEXT,
+                    current_relative_path TEXT,
+                    quiesced INTEGER NOT NULL DEFAULT 0 CHECK (quiesced IN (0,1))
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_generation
                     ON index_generations((1))
-                    WHERE state IN ('running','pause_requested','stop_requested');
+                    WHERE state IN ('queued','starting','running','pause_requested','stopping');
                 CREATE INDEX IF NOT EXISTS idx_generation_identity
                     ON index_generations(disk_stable_id,lineage_id,filesystem_uuid);
                 CREATE TABLE IF NOT EXISTS index_pending_directories (
@@ -144,6 +152,44 @@ class IndexStore:
             )
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
+    @staticmethod
+    def _migrate_v4(db: sqlite3.Connection) -> None:
+        """Rebuild only the v4 coordinator table to lock the Phase 2 state vocabulary."""
+        db.executescript("""
+            DROP INDEX IF EXISTS idx_one_active_generation;
+            ALTER TABLE index_generations RENAME TO index_generations_v4;
+            CREATE TABLE index_generations (
+                generation_id TEXT PRIMARY KEY, disk_stable_id TEXT NOT NULL, lineage_id TEXT NOT NULL,
+                filesystem_uuid TEXT NOT NULL, source_root TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('queued','starting','running','pause_requested','paused',
+                    'waiting_for_remount','stopping','stopped','interrupted','completed',
+                    'completed_with_errors','failed')),
+                is_partial INTEGER NOT NULL DEFAULT 1 CHECK (is_partial IN (0,1)),
+                control TEXT CHECK (control IN ('pause','stop') OR control IS NULL),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT,
+                lease_owner TEXT, lease_expires_at TEXT, heartbeat_at TEXT,
+                entries_seen INTEGER NOT NULL DEFAULT 0 CHECK(entries_seen>=0),
+                files_seen INTEGER NOT NULL DEFAULT 0 CHECK(files_seen>=0),
+                directories_seen INTEGER NOT NULL DEFAULT 0 CHECK(directories_seen>=0),
+                logical_bytes INTEGER NOT NULL DEFAULT 0 CHECK(logical_bytes>=0), detail TEXT,
+                current_relative_path TEXT, quiesced INTEGER NOT NULL DEFAULT 0 CHECK(quiesced IN (0,1))
+            );
+            INSERT INTO index_generations
+            SELECT generation_id,disk_stable_id,lineage_id,filesystem_uuid,source_root,
+                CASE state WHEN 'waiting_for_media' THEN 'waiting_for_remount'
+                           WHEN 'stop_requested' THEN 'stopping' ELSE state END,
+                is_partial,control,created_at,updated_at,finished_at,lease_owner,lease_expires_at,
+                heartbeat_at,entries_seen,files_seen,directories_seen,logical_bytes,detail,NULL,
+                CASE WHEN state IN ('paused','stopped','interrupted','waiting_for_media','completed','failed')
+                     THEN 1 ELSE 0 END
+            FROM index_generations_v4;
+            DROP TABLE index_generations_v4;
+            CREATE UNIQUE INDEX idx_one_active_generation ON index_generations((1))
+                WHERE state IN ('queued','starting','running','pause_requested','stopping');
+            CREATE INDEX IF NOT EXISTS idx_generation_identity
+                ON index_generations(disk_stable_id,lineage_id,filesystem_uuid);
+        """)
+
     def create_generation(self, identity: FilesystemIdentity, root: Path) -> str:
         generation_id = uuid.uuid4().hex
         timestamp = _now()
@@ -153,7 +199,7 @@ class IndexStore:
                     """INSERT INTO index_generations(
                         generation_id,disk_stable_id,lineage_id,filesystem_uuid,source_root,
                         state,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,'running',?,?)""",
+                    ) VALUES(?,?,?,?,?,'queued',?,?)""",
                     (generation_id, *identity.values(), str(root), timestamp, timestamp),
                 )
             except sqlite3.IntegrityError as error:
@@ -168,11 +214,28 @@ class IndexStore:
             raise IndexingError("INDEX_NOT_FOUND", "Generation not found")
         return dict(row)
 
+    def generations(self, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), MAX_QUERY_LIMIT))
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM index_generations ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_for(self, disk_stable_id: str, lineage_id: str | None = None) -> list[dict[str, Any]]:
+        sql = """SELECT * FROM index_generations WHERE disk_stable_id=?
+            AND (state IN ('queued','starting','running','pause_requested','stopping') OR quiesced=0)"""
+        parameters: list[Any] = [disk_stable_id]
+        if lineage_id is not None:
+            sql += " AND lineage_id=?"
+            parameters.append(lineage_id)
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(sql, parameters).fetchall()]
+
     def set_control(self, generation_id: str, control: Literal["pause", "stop"]) -> None:
-        state = "pause_requested" if control == "pause" else "stop_requested"
+        state = "pause_requested" if control == "pause" else "stopping"
         with self.connect() as db:
             changed = db.execute(
-                "UPDATE index_generations SET state=?,control=?,updated_at=? WHERE generation_id=? AND state='running'",
+                """UPDATE index_generations SET state=?,control=?,updated_at=?
+                WHERE generation_id=? AND state IN ('queued','starting','running')""",
                 (state, control, _now(), generation_id),
             ).rowcount
         if not changed:
@@ -182,14 +245,15 @@ class IndexStore:
         recovered: list[str] = []
         with self.connect() as db:
             rows = db.execute(
-                "SELECT * FROM index_generations WHERE state IN ('running','pause_requested','stop_requested')"
+                """SELECT * FROM index_generations
+                WHERE state IN ('queued','starting','running','pause_requested','stopping')"""
             ).fetchall()
             for row in rows:
                 identity = FilesystemIdentity(row["disk_stable_id"], row["lineage_id"], row["filesystem_uuid"])
-                state = "interrupted" if available(identity) else "waiting_for_media"
+                state = "interrupted" if available(identity) else "waiting_for_remount"
                 db.execute(
                     """UPDATE index_generations SET state=?,control=NULL,lease_owner=NULL,
-                    lease_expires_at=NULL,heartbeat_at=NULL,updated_at=?,detail=? WHERE generation_id=?""",
+                    lease_expires_at=NULL,heartbeat_at=NULL,quiesced=1,updated_at=?,detail=? WHERE generation_id=?""",
                     (state, _now(), "Recovered after an unclean worker exit", row["generation_id"]),
                 )
                 recovered.append(row["generation_id"])
@@ -236,7 +300,7 @@ class MetadataEngine:
             raise IndexingError("NOT_RESUMABLE", "Generation is not resumable")
         with self.store.connect() as db:
             db.execute(
-                """UPDATE index_generations SET state='running',control=NULL,
+                """UPDATE index_generations SET state='starting',control=NULL,quiesced=0,
                 detail=NULL,updated_at=? WHERE generation_id=?""",
                 (_now(), generation_id),
             )
@@ -246,8 +310,9 @@ class MetadataEngine:
         processed = 0
         with self.store.connect() as db:
             db.execute(
-                "UPDATE index_generations SET lease_owner=?,heartbeat_at=?,updated_at=? WHERE generation_id=?",
-                (uuid.uuid4().hex, _now(), _now(), generation_id),
+                """UPDATE index_generations SET state='running',lease_owner=?,lease_expires_at=?,
+                heartbeat_at=?,quiesced=0,updated_at=? WHERE generation_id=?""",
+                (uuid.uuid4().hex, _lease_time(), _now(), _now(), generation_id),
             )
         while max_directories is None or processed < max_directories:
             state = self.store.generation(generation_id)
@@ -266,7 +331,7 @@ class MetadataEngine:
         expected = (row["disk_stable_id"], row["lineage_id"], row["filesystem_uuid"])
         if expected != self.identity.values() or Path(row["source_root"]) != self.root:
             raise IndexingError("IDENTITY_MISMATCH", "Generation identity or root does not match")
-        if row["state"] not in ("running", "pause_requested", "stop_requested"):
+        if row["state"] not in ("queued", "starting", "running", "pause_requested", "stopping"):
             raise IndexingError("NOT_RUNNING", "Generation is not running")
 
     def _next_pending(self, generation_id: str) -> str | None:
@@ -323,14 +388,17 @@ class MetadataEngine:
             )
             db.execute(
                 """UPDATE index_generations SET entries_seen=entries_seen+?,files_seen=files_seen+?,
-                directories_seen=directories_seen+?,logical_bytes=logical_bytes+?,heartbeat_at=?,updated_at=?
+                directories_seen=directories_seen+?,logical_bytes=logical_bytes+?,current_relative_path=?,
+                heartbeat_at=?,lease_expires_at=?,updated_at=?
                 WHERE generation_id=?""",
                 (
                     len(rows),
                     sum(row[3] == "file" for row in rows),
                     sum(row[3] == "directory" for row in rows),
                     sum(row[4] for row in rows),
+                    relative,
                     timestamp,
+                    _lease_time(),
                     timestamp,
                     generation_id,
                 ),
@@ -388,7 +456,8 @@ class MetadataEngine:
         with self.store.connect() as db:
             db.execute(
                 """UPDATE index_generations SET state=?,control=NULL,lease_owner=NULL,
-                lease_expires_at=NULL,heartbeat_at=NULL,finished_at=?,updated_at=? WHERE generation_id=?""",
+                lease_expires_at=NULL,heartbeat_at=NULL,quiesced=1,finished_at=?,updated_at=?
+                WHERE generation_id=?""",
                 (state, finished, _now(), generation_id),
             )
 
@@ -401,8 +470,10 @@ class MetadataEngine:
             if pending:
                 raise RuntimeError("cannot complete while pending work remains")
             db.execute(
-                """UPDATE index_generations SET state='completed',is_partial=0,control=NULL,
-                lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,finished_at=?,updated_at=?
+                """UPDATE index_generations SET state=CASE WHEN EXISTS (
+                    SELECT 1 FROM index_path_errors e WHERE e.generation_id=index_generations.generation_id
+                ) THEN 'completed_with_errors' ELSE 'completed' END,is_partial=0,control=NULL,
+                lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,quiesced=1,finished_at=?,updated_at=?
                 WHERE generation_id=?""",
                 (timestamp, timestamp, generation_id),
             )

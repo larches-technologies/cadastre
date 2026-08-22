@@ -33,7 +33,7 @@ class IndexingTests(unittest.TestCase):
         store = IndexStore(path)
         store.initialize()
         with store.connect() as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(db.execute("SELECT value FROM legacy").fetchone()[0], "preserved")
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertTrue(

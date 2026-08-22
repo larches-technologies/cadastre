@@ -14,7 +14,9 @@ from urllib.parse import parse_qs, urlparse
 from cadastre import __version__
 from cadastre.connected import ActionError, ConnectedDevices
 from cadastre.discovery import DiscoveryError, discover_disks, filter_system_disks
+from cadastre.indexing import FilesystemIdentity, IndexingError, IndexQuery, IndexStore
 from cadastre.store import Store
+from cadastre.supervisor import IndexSupervisor
 
 LOG = logging.getLogger("cadastre")
 STATIC = Path(__file__).parent.parent / "static"
@@ -25,12 +27,16 @@ def create_server(
     port: int = 8741,
     db_path: str = "data/cadastre.db",
     connected_devices: ConnectedDevices | None = None,
+    index_supervisor: IndexSupervisor | None = None,
 ) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("Cadastre MVP0 only permits a local-only bind")
     store = Store(db_path)
     store.initialize()
     connected = connected_devices or ConnectedDevices()
+    index_store = IndexStore(db_path)
+    index_store.initialize()
+    supervisor = index_supervisor or IndexSupervisor(index_store, connected)
     action_token = secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -106,6 +112,27 @@ def create_server(
                     HTTPStatus.OK,
                     {"disks": store.list_disks(), "version": __version__},
                 )
+            elif parsed.path == "/api/indexes":
+                limit = parse_qs(parsed.query).get("limit", ["50"])[0]
+                self.json_response(200, {"generations": index_store.generations(int(limit))})
+            elif parsed.path.startswith("/api/indexes/"):
+                parts = parsed.path.split("/")
+                try:
+                    generation_id = parts[3]
+                    if len(parts) == 4:
+                        data = index_store.generation(generation_id)
+                    elif len(parts) == 5 and parts[4] == "search":
+                        query = parse_qs(parsed.query)
+                        data = IndexQuery(index_store).search(
+                            generation_id, query.get("q", [""])[0], int(query.get("limit", ["50"])[0])
+                        )
+                    elif len(parts) == 5 and parts[4] == "summary":
+                        data = IndexQuery(index_store).summary(generation_id)
+                    else:
+                        raise IndexingError("INDEX_ROUTE_NOT_FOUND", "Index route not found")
+                    self.json_response(200, data)
+                except (IndexingError, ValueError) as exc:
+                    self.index_error(exc)
             elif parsed.path == "/api/discovery":
                 try:
                     result = discover_disks()
@@ -144,6 +171,11 @@ def create_server(
             self.end_headers()
             self.wfile.write(body)
 
+        def index_error(self, error: Exception) -> None:
+            code = getattr(error, "code", "INVALID_REQUEST")
+            status = 404 if code in {"INDEX_NOT_FOUND", "INDEX_ROUTE_NOT_FOUND"} else 409
+            self.error_response(status, code, str(error))
+
         def do_DELETE(self) -> None:  # noqa: N802
             if not self.authorized_action():
                 return
@@ -156,6 +188,12 @@ def create_server(
 
             stable_id = unquote(parsed.path[len(prefix) :])
             try:
+                active = index_store.active_for(stable_id)
+                if active:
+                    self.error_response(
+                        409, "INDEX_ACTIVE", "Indexing is active or not confirmed quiesced", data={"generations": active}
+                    )
+                    return
                 removed = store.remove_disk(stable_id)
                 self.json_response(HTTPStatus.OK, {"removed": removed})
             except KeyError:
@@ -165,11 +203,52 @@ def create_server(
             if not self.authorized_action():
                 return
             action_path = urlparse(self.path).path
+            if action_path.startswith("/api/indexes"):
+                try:
+                    payload = self.request_json()
+                    if action_path == "/api/indexes/start":
+                        partition = store.get_partition(payload.get("incarnationId", ""))
+                        identity = FilesystemIdentity(
+                            partition["diskStableId"], partition["lineageId"], partition["filesystemUuid"]
+                        )
+                        self.json_response(202, supervisor.start(identity))
+                        return
+                    parts = action_path.split("/")
+                    generation_id, action = parts[3], parts[4]
+                    result = (
+                        supervisor.resume(generation_id)
+                        if action == "resume"
+                        else supervisor.control(generation_id, action)
+                    )
+                    self.json_response(202, result)
+                except (IndexingError, KeyError, ValueError, IndexError) as exc:
+                    self.index_error(exc)
+                return
             if action_path in {"/api/connected/mount", "/api/connected/unmount", "/api/connected/eject"}:
                 try:
                     payload = self.request_json()
                     if payload.get("confirmed") is not True:
                         self.error_response(409, "CONFIRMATION_REQUIRED", "Explicit confirmation is required")
+                        return
+                    if action_path.endswith("unmount"):
+                        active = []
+                        for disk in connected.live():
+                            for part in disk.get("partitions", []):
+                                if part.get("device") == payload.get("device", ""):
+                                    active = index_store.active_for(
+                                        disk["stableId"], part.get("lineageId") or part.get("incarnationId")
+                                    )
+                    elif action_path.endswith("eject"):
+                        active = index_store.active_for(payload.get("stableId", ""))
+                    else:
+                        active = []
+                    if active:
+                        self.error_response(
+                            409,
+                            "INDEX_ACTIVE",
+                            "Indexing is active or not confirmed quiesced",
+                            data={"generations": active},
+                        )
                         return
                     result = (
                         connected.mount(payload.get("device", ""))
