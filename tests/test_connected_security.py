@@ -378,6 +378,8 @@ class ApiSecurityTests(unittest.TestCase):
     def test_ui_contract_uses_accessible_distinct_dialogs_and_semantic_links(self):
         html = urllib.request.urlopen(self.base + "/").read().decode()
         script = urllib.request.urlopen(self.base + "/app.js").read().decode()
+        presentation = urllib.request.urlopen(self.base + "/file-presentation.js").read().decode()
+        self.assertIn('stroke="currentColor"', presentation)
         self.assertIn('id="browser-dialog"', html)
         self.assertIn('aria-labelledby="browser-title"', html)
         self.assertIn('id="preview-dialog"', html)
@@ -485,3 +487,26 @@ class ConnectedUiContractTests(unittest.TestCase):
         self.assertIn("req('/api/connected?includeSystem='+$('#show-connected-system').checked)", js)
         self.assertIn("$('#refresh-connected').onclick=connected", js)
         self.assertIn("$('#show-connected-system').onchange=connected", js)
+
+
+class FilePresentationUiContractTests(unittest.TestCase):
+    def test_file_presentation_classifier_and_dom_contract(self):
+        root = Path(__file__).parent.parent
+        subprocess.run(
+            ["node", "tests/file-presentation.test.js"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        app = (root / "static/app.js").read_text()
+        presentation = (root / "static/file-presentation.js").read_text()
+        html = (root / "static/index.html").read_text()
+        context = app[app.index("function contextMarkup") : app.index("function closeBrowser")]
+        self.assertNotIn("Current relative path", context)
+        self.assertIn("CadastreFilePresentation.directoryTitle(d.context)", app)
+        self.assertIn("'+esc(directoryTitle)+'", app)
+        self.assertIn('class="mono directory-title"', app)
+        self.assertIn('aria-hidden="true"', presentation)
+        self.assertIn('stroke="currentColor"', presentation)
+        self.assertIn('<script src="/file-presentation.js"></script><script src="/app.js"></script>', html)

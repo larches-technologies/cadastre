@@ -166,7 +166,7 @@ def create_server(
                 self.serve_file(STATIC / "index.html", "text/html; charset=utf-8")
             elif parsed.path == "/app.css":
                 self.serve_file(STATIC / "app.css", "text/css; charset=utf-8")
-            elif parsed.path in {"/app.js", "/indexing.js"}:
+            elif parsed.path in {"/app.js", "/indexing.js", "/file-presentation.js"}:
                 self.serve_file(STATIC / parsed.path.lstrip("/"), "text/javascript; charset=utf-8")
             else:
                 self.error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Route not found")
